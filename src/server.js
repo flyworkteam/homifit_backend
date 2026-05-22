@@ -8,7 +8,7 @@ async function start() {
   validateEnv();
   await testConnection();
 
-  const port = Number.parseInt(process.env.PORT || '3035', 10);
+  const port = Number.parseInt(process.env.PORT || '3000', 10);
   app.listen(port, () => {
     console.log(`HomiFit backend is running on port ${port}`);
   });

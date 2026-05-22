@@ -7,3 +7,6 @@ config/firebase-service-account.json
 .DS_Store
 coverage/
 dist/
+
+# Runtime-uploaded user content (avatars, etc.)
+uploads/

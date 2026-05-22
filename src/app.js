@@ -49,8 +49,20 @@ app.use(
 
       callback(new AppError('CORS origin not allowed', 403));
     },
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Id', 'Accept-Language'],
+    exposedHeaders: ['Authorization'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   }),
 );
+
+// Pre-morgan ultra-light logger so we see EVERY request that reaches Express
+// (including CORS preflights and 4xx that morgan suppresses in some configs).
+app.use((req, res, next) => {
+  // eslint-disable-next-line no-console
+  console.log(`[REQ] ${req.method} ${req.url} origin=${req.headers.origin || '-'}`);
+  next();
+});
 
 app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));

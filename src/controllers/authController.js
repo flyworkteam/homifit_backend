@@ -159,6 +159,99 @@ async function signInWithFirebase(req, res, next) {
   }
 }
 
+/**
+ * Issue a JWT for a "guest" account that has no Firebase credential. Used
+ * by the Misafir / Continue-as-Guest button when Firebase Anonymous Auth
+ * isn't enabled in the Firebase console (or is unreachable). Generates a
+ * random `firebase_uid` of the form `guest_<uuid>` and inserts a row with
+ * `guest=1` so downstream queries can distinguish guests if needed.
+ *
+ * If the client passes an existing `firebaseUid` body param (e.g. when the
+ * Firebase Anonymous credential WAS issued), we'll reuse it so the same
+ * user row gets hit on subsequent calls.
+ */
+async function signInAsGuest(req, res, next) {
+  try {
+    const body = req.body || {};
+    const passedUid = String(body.firebaseUid || '').trim();
+    const firebaseUid = passedUid || `guest_${crypto.randomUUID()}`;
+    const locale = String(body.locale || 'en').slice(0, 8);
+    const timezone = body.timezone ? String(body.timezone).slice(0, 64) : null;
+
+    const conn = await pool.getConnection();
+    let user;
+    try {
+      await conn.beginTransaction();
+      const [existing] = await conn.execute(
+        'SELECT * FROM users WHERE firebase_uid = ? LIMIT 1',
+        [firebaseUid],
+      );
+      if (existing.length > 0) {
+        const found = existing[0];
+        await conn.execute(
+          `UPDATE users
+             SET locale = ?,
+                 timezone = COALESCE(?, timezone),
+                 is_active = 1,
+                 last_login_at = CURRENT_TIMESTAMP
+           WHERE id = ?`,
+          [locale, timezone, found.id],
+        );
+        const [refreshed] = await conn.execute(
+          'SELECT * FROM users WHERE id = ?',
+          [found.id],
+        );
+        user = refreshed[0];
+      } else {
+        const [insert] = await conn.execute(
+          `INSERT INTO users
+             (firebase_uid, email, display_name, photo_url, locale, timezone, guest, last_login_at)
+           VALUES (?, NULL, 'Guest', NULL, ?, ?, 1, CURRENT_TIMESTAMP)`,
+          [firebaseUid, locale, timezone],
+        );
+        const [created] = await conn.execute(
+          'SELECT * FROM users WHERE id = ?',
+          [insert.insertId],
+        );
+        user = created[0];
+        await conn.execute('INSERT INTO user_profile (user_id) VALUES (?)', [user.id]);
+        await conn.execute(
+          'INSERT INTO user_notification_prefs (user_id, locale) VALUES (?, ?)',
+          [user.id, locale],
+        );
+        await conn.execute('INSERT INTO user_streak_counters (user_id) VALUES (?)', [user.id]);
+      }
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback();
+      throw error;
+    } finally {
+      conn.release();
+    }
+
+    const accessToken = signUserToken({
+      userId: user.id,
+      sub: String(user.id),
+      firebase_uid: user.firebase_uid,
+      guest: true,
+    });
+    const refresh = await issueRefreshToken(user.id, req);
+
+    res.json({
+      success: true,
+      data: {
+        token: accessToken,
+        refreshToken: refresh.token,
+        refreshExpiresAt: refresh.expiresAt.toISOString(),
+        user: rowToUser(user),
+      },
+      error: null,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
 async function refreshToken(req, res, next) {
   try {
     const body = req.body || {};
@@ -232,6 +325,7 @@ async function logout(req, res, next) {
 
 module.exports = {
   signInWithFirebase,
+  signInAsGuest,
   refreshToken,
   logout,
 };

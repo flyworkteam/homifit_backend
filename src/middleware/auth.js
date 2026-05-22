@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const AppError = require('../utils/appError');
+const { pool } = require('../config/db');
 
 function parseBearerToken(authorization) {
   if (!authorization || typeof authorization !== 'string') {
@@ -121,6 +122,86 @@ function requireAuth(req, res, next) {
   return requireDevUser(req, next);
 }
 
+/**
+ * Load the user's premium status into `req.premium` so downstream handlers
+ * can branch on it cheaply. Always populates the field (never throws on
+ * "no row found" — that just maps to `isPremium=false`). Call AFTER
+ * `requireAuth` so `req.userId` is set.
+ *
+ * Result shape (mirrors `rowToStatus` in premiumController):
+ *   { isPremium: bool, entitlement, productId, currentPeriodEnd, trialEnd,
+ *     cancelledAt, promoDiscountPct }
+ *
+ * Trial detection: a user with `is_premium=0` but `trial_end > NOW()` is
+ * still treated as premium (the backend-managed trial sets is_premium=1
+ * anyway; this is a safety net for legacy rows).
+ */
+async function loadPremium(req, res, next) {
+  void res;
+  try {
+    if (!req.userId) {
+      req.premium = { isPremium: false };
+      return next();
+    }
+    const [rows] = await pool.execute(
+      `SELECT is_premium, entitlement, product_id, current_period_end,
+              trial_end, cancelled_at, promo_discount_pct
+         FROM premium_status
+        WHERE user_id = ?
+        LIMIT 1`,
+      [req.userId],
+    );
+    const r = rows[0];
+    const now = Date.now();
+    const trialActive =
+      r && r.trial_end && new Date(r.trial_end).getTime() > now;
+    req.premium = {
+      isPremium: Boolean(r && (r.is_premium || trialActive)),
+      entitlement: r ? r.entitlement : null,
+      productId: r ? r.product_id : null,
+      currentPeriodEnd: r ? r.current_period_end : null,
+      trialEnd: r ? r.trial_end : null,
+      cancelledAt: r ? r.cancelled_at : null,
+      promoDiscountPct: r ? r.promo_discount_pct : 0,
+    };
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
+
+/**
+ * Hard-gate a route behind an active premium subscription. Use as the
+ * middleware AFTER `requireAuth` for any endpoint that should be Pro-only
+ * (e.g., advanced plan creation, 30-day plans, premium templates).
+ *
+ *   router.post('/something', requireAuth, requirePremium, controller.do);
+ *
+ * Returns 402 PAYMENT_REQUIRED so the client can route the user to the
+ * paywall. The body includes a `lockedReason` for the UI to surface.
+ */
+async function requirePremium(req, res, next) {
+  try {
+    if (!req.premium) {
+      await new Promise((resolve, reject) => {
+        loadPremium(req, res, (err) => (err ? reject(err) : resolve()));
+      });
+    }
+    if (req.premium && req.premium.isPremium) {
+      return next();
+    }
+    return next(
+      new AppError('Premium subscription required', 402, {
+        lockedReason: 'premium_required',
+      }),
+    );
+  } catch (error) {
+    return next(error);
+  }
+}
+
 module.exports = {
   requireAuth,
+  loadPremium,
+  requirePremium,
 };

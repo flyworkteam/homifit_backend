@@ -41,6 +41,141 @@ async function getStatus(req, res, next) {
   }
 }
 
+// Per `docs/HomiFit – Premium Paket Özellikleri.docx`:
+//   "HomiFit ilk kez indirildiğinde kullanıcıya sınırlı ücretsiz kullanım
+//    hakkı tanımlanır. (1 gün)"
+// Duration is in milliseconds (1 day).
+const TRIAL_DURATION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Start a 1-day backend-managed free trial for the current user. Idempotent:
+ *   - If the user already has an active subscription → 400 (no need).
+ *   - If a trial was already started (active OR expired) → return the same
+ *     `trial_end` and no-op. Free trials are one-shot per user.
+ *   - Otherwise insert / update `premium_status` with
+ *       is_premium = 1
+ *       entitlement = 'trial'
+ *       trial_end = NOW + 1 day
+ *
+ * Called by the client once per install at end-of-onboarding (or on first
+ * authenticated launch if the user skipped onboarding).
+ */
+async function startTrial(req, res, next) {
+  try {
+    const [rows] = await pool.execute(
+      'SELECT * FROM premium_status WHERE user_id = ? LIMIT 1',
+      [req.userId],
+    );
+    const existing = rows[0] || null;
+
+    if (existing && existing.is_premium && existing.entitlement &&
+        existing.entitlement !== 'trial') {
+      // Already a paying subscriber — nothing to do.
+      return res.json({
+        success: true,
+        data: { ...rowToStatus(existing), alreadyPremium: true },
+        error: null,
+      });
+    }
+
+    if (existing && existing.trial_end) {
+      // Trial was already started for this user — return the same window.
+      // Don't extend; that would defeat the one-shot purpose.
+      return res.json({
+        success: true,
+        data: { ...rowToStatus(existing), trialAlreadyUsed: true },
+        error: null,
+      });
+    }
+
+    const now = new Date();
+    const trialEnd = new Date(now.getTime() + TRIAL_DURATION_MS);
+    await pool.execute(
+      `INSERT INTO premium_status (user_id, is_premium, entitlement,
+          current_period_start, current_period_end, trial_end, store)
+       VALUES (?, 1, 'trial', ?, ?, ?, 'manual')
+       ON DUPLICATE KEY UPDATE
+         is_premium = 1,
+         entitlement = 'trial',
+         current_period_start = VALUES(current_period_start),
+         current_period_end = VALUES(current_period_end),
+         trial_end = VALUES(trial_end),
+         store = 'manual'`,
+      [req.userId, now, trialEnd, trialEnd],
+    );
+
+    const [refreshed] = await pool.execute(
+      'SELECT * FROM premium_status WHERE user_id = ? LIMIT 1',
+      [req.userId],
+    );
+    res.json({
+      success: true,
+      data: { ...rowToStatus(refreshed[0] || null), trialStarted: true },
+      error: null,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * Pricing source of truth for the paywall.
+ *
+ * Returns the user-facing monthly / yearly prices for the current user. Today
+ * the base prices are hardcoded here; once RevenueCat is wired in, swap this
+ * out for an SDK call. The user's streak reward (`user_streak_counters.
+ * discount_active` + `discount_percent`) is automatically applied to the
+ * discounted price so the paywall can show "-25%" without any client logic.
+ */
+async function getPricing(req, res, next) {
+  try {
+    const [counters] = await pool.execute(
+      `SELECT discount_active, discount_percent
+         FROM user_streak_counters
+        WHERE user_id = ?
+        LIMIT 1`,
+      [req.userId],
+    );
+    const row = counters[0] || {};
+    const discountActive = Boolean(row.discount_active);
+    const discountPct = Math.max(
+      0,
+      Math.min(80, Number.parseInt(row.discount_percent, 10) || 0),
+    );
+
+    // Per `docs/HomiFit – Premium Paket Özellikleri.docx`:
+    // Aylık 1.99 USD, Yıllık 11.99 USD, 1 günlük deneme süresi.
+    const baseMonthly = 1.99;
+    const baseYearly = 11.99;
+    const trialDays = 1;
+
+    const monthly = discountActive
+      ? Math.round(baseMonthly * (100 - discountPct)) / 100
+      : baseMonthly;
+    const yearly = discountActive
+      ? Math.round(baseYearly * (100 - discountPct)) / 100
+      : baseYearly;
+
+    res.json({
+      success: true,
+      data: {
+        currency: 'USD',
+        currencySymbol: '$',
+        trialDays,
+        discountActive,
+        discountPercent: discountPct,
+        baseMonthly,
+        baseYearly,
+        monthly,
+        yearly,
+      },
+      error: null,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
 function timingSafeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   const ab = Buffer.from(a);
@@ -191,5 +326,7 @@ async function revenueCatWebhook(req, res, next) {
 
 module.exports = {
   getStatus,
+  getPricing,
+  startTrial,
   revenueCatWebhook,
 };

@@ -254,9 +254,43 @@ async function getPlan(req, res, next) {
   }
 }
 
+// Maximum number of active (non-archived) plans a free user may own.
+// Per `docs/HomiFit – Premium Paket Özellikleri.docx` the free tier is
+// limited to a small handful of programs; the spec example is "5". Adjust
+// here if Product changes the number.
+const FREE_PLAN_LIMIT = 5;
+
 async function createPlan(req, res, next) {
   try {
     const input = validatePlanInput(req.body);
+    const isPremium = Boolean(req.premium && req.premium.isPremium);
+
+    // Premium gates (spec: "Tüm antrenman seviyelerine erişim", "Sınırsız
+    // egzersiz programına erişim"):
+    //   1. Free users can't create `advanced` plans.
+    //   2. Free users are capped at FREE_PLAN_LIMIT active plans.
+    if (!isPremium && input.level === 'advanced') {
+      throw new AppError(
+        'Advanced-level plans are a Premium feature',
+        402,
+        { lockedReason: 'premium_required', requiredLevel: 'advanced' },
+      );
+    }
+    if (!isPremium) {
+      const [countRows] = await pool.execute(
+        `SELECT COUNT(*) AS n FROM user_plans
+          WHERE user_id = ? AND is_archived = 0`,
+        [req.userId],
+      );
+      const currentCount = (countRows[0] && countRows[0].n) || 0;
+      if (currentCount >= FREE_PLAN_LIMIT) {
+        throw new AppError(
+          `Free users can have up to ${FREE_PLAN_LIMIT} active plans. Upgrade to add more.`,
+          402,
+          { lockedReason: 'premium_required', planLimit: FREE_PLAN_LIMIT },
+        );
+      }
+    }
 
     const conn = await pool.getConnection();
     try {

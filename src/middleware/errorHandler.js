@@ -22,9 +22,15 @@ function errorHandler(err, req, res, next) {
     console.error('API error:', logPayload);
   }
 
+  // AppError instances may carry extra context (e.g. `lockedReason` from
+  // requirePremium) — surface it as `data` so clients can branch on it.
+  const data = err && err.meta && typeof err.meta === 'object'
+      ? err.meta
+      : null;
+
   res.status(statusCode).json({
     success: false,
-    data: null,
+    data,
     error: message,
   });
 }
