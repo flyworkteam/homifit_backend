@@ -85,11 +85,19 @@ async function loadTemplatePreviews(templateIds) {
     templateIds,
   );
   const countMap = new Map(counts.map((c) => [c.template_id, c.n]));
-  const result = new Map();
+  // Group exercises per template, then pick one offset by the template id so
+  // templates that share moves still surface different preview videos /
+  // thumbnails instead of every card showing the same image.
+  const byTemplate = new Map();
   for (const r of rows) {
-    if (result.has(r.template_id)) continue;
-    const url = r.video_url || (r.video_cdn_path ? buildVideoUrl(r.video_cdn_path) : null);
-    result.set(r.template_id, { videoUrl: url, count: countMap.get(r.template_id) || 0 });
+    if (!byTemplate.has(r.template_id)) byTemplate.set(r.template_id, []);
+    byTemplate.get(r.template_id).push(r);
+  }
+  const result = new Map();
+  for (const [tid, list] of byTemplate) {
+    const pick = list[tid % list.length];
+    const url = pick.video_url || (pick.video_cdn_path ? buildVideoUrl(pick.video_cdn_path) : null);
+    result.set(tid, { videoUrl: url, count: countMap.get(tid) || 0 });
   }
   // Fill missing template ids (no exercises linked).
   for (const id of templateIds) {
