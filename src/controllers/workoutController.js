@@ -11,6 +11,31 @@ function buildVideoUrl(cdnPath) {
   }
 }
 
+// Maps the CDN folder an exercise video lives in to the muscle label the
+// client localizes (exercise_labels.dart). Used as a fallback when the
+// `primary_muscle` column is empty so the workout-detail cards can still show
+// a muscle sub-line. Unknown folders (plans, stretches, loose files) → null.
+const MUSCLE_BY_FOLDER = {
+  bacak: 'Legs',
+  gogus: 'Chest',
+  'karin-kaslari': 'Core',
+  kol: 'Arms',
+  'omuz-sirt': 'Shoulders',
+  sirt: 'Back',
+  omuz: 'Shoulders',
+  kalca: 'Glutes',
+  'tum-vucut': 'Full Body',
+  'bacak-ve-kalca-guclendirme': 'Legs · Glutes',
+};
+
+function deriveMuscle(path) {
+  if (!path || typeof path !== 'string') return null;
+  const segs = path.split('/').filter(Boolean);
+  if (segs.length < 2) return null;
+  const folder = segs[segs.length - 2].toLowerCase();
+  return MUSCLE_BY_FOLDER[folder] || null;
+}
+
 function rowToExercise(r, locale) {
   if (!r) return null;
   const isTr = String(locale || '').toLowerCase().startsWith('tr');
@@ -18,7 +43,8 @@ function rowToExercise(r, locale) {
     id: r.id,
     slug: r.slug,
     name: (isTr && r.name_tr) ? r.name_tr : r.name_en,
-    primaryMuscle: r.primary_muscle,
+    primaryMuscle:
+      r.primary_muscle || deriveMuscle(r.video_cdn_path || r.video_url),
     secondaryMuscles: r.secondary_muscles
       ? (typeof r.secondary_muscles === 'string'
           ? JSON.parse(r.secondary_muscles)
