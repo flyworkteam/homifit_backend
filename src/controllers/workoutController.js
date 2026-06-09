@@ -62,7 +62,7 @@ function rowToExercise(r, locale) {
   };
 }
 
-function rowToTemplate(t, locale, previewVideoUrl, opts) {
+function rowToTemplate(t, locale, preview, opts) {
   if (!t) return null;
   const isTr = String(locale || '').toLowerCase().startsWith('tr');
   const isPremiumTemplate = Boolean(t.is_premium);
@@ -74,11 +74,15 @@ function rowToTemplate(t, locale, previewVideoUrl, opts) {
     title: (isTr && t.title_tr) ? t.title_tr : t.title_en,
     level: t.level,
     durationMin: t.duration_min,
-    thumbnailUrl: buildVideoUrl(t.thumbnail_path),
+    // Prefer the template's own thumbnail; otherwise fall back to the poster
+    // of its representative exercise so each card shows a real, distinct image
+    // (instead of the client's small slug-hashed fallback library).
+    thumbnailUrl:
+      buildVideoUrl(t.thumbnail_path) || (preview && preview.thumbnailUrl) || null,
     // First exercise's CDN video URL — used as a looping thumbnail preview
     // on the home / quick / category cards. Frontend can render it via
     // ExerciseVideoPlayer.
-    previewVideoUrl: previewVideoUrl || null,
+    previewVideoUrl: (preview && preview.videoUrl) || null,
     exerciseCount: t._exerciseCount ?? null,
     isPremium: isPremiumTemplate,
     // True only when this template is premium AND the requesting user is
@@ -96,7 +100,7 @@ async function loadTemplatePreviews(templateIds) {
   if (templateIds.length === 0) return new Map();
   const placeholders = templateIds.map(() => '?').join(',');
   const [rows] = await pool.execute(
-    `SELECT wte.template_id, wte.position, e.video_url, e.video_cdn_path
+    `SELECT wte.template_id, wte.position, e.video_url, e.video_cdn_path, e.thumbnail_path
        FROM workout_template_exercises wte
        JOIN exercises e ON e.id = wte.exercise_id
       WHERE wte.template_id IN (${placeholders})
@@ -123,11 +127,12 @@ async function loadTemplatePreviews(templateIds) {
   for (const [tid, list] of byTemplate) {
     const pick = list[tid % list.length];
     const url = pick.video_url || (pick.video_cdn_path ? buildVideoUrl(pick.video_cdn_path) : null);
-    result.set(tid, { videoUrl: url, count: countMap.get(tid) || 0 });
+    const thumb = pick.thumbnail_path ? buildVideoUrl(pick.thumbnail_path) : null;
+    result.set(tid, { videoUrl: url, thumbnailUrl: thumb, count: countMap.get(tid) || 0 });
   }
   // Fill missing template ids (no exercises linked).
   for (const id of templateIds) {
-    if (!result.has(id)) result.set(id, { videoUrl: null, count: countMap.get(id) || 0 });
+    if (!result.has(id)) result.set(id, { videoUrl: null, thumbnailUrl: null, count: countMap.get(id) || 0 });
   }
   return result;
 }
@@ -291,7 +296,7 @@ async function getCategory(req, res, next) {
         templates: templates.map((t) => {
           const p = previews.get(t.id);
           t._exerciseCount = p?.count ?? 0;
-          return rowToTemplate(t, locale, p?.videoUrl, { isPremiumUser });
+          return rowToTemplate(t, locale, p, { isPremiumUser });
         }),
       },
       error: null,
@@ -403,7 +408,7 @@ async function listQuickWorkouts(req, res, next) {
         quickWorkouts: templates.map((t) => {
           const p = previews.get(t.id);
           t._exerciseCount = p?.count ?? 0;
-          return rowToTemplate(t, locale, p?.videoUrl, { isPremiumUser });
+          return rowToTemplate(t, locale, p, { isPremiumUser });
         }),
       },
       error: null,
