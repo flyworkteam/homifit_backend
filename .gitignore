@@ -10,3 +10,10 @@ dist/
 
 # Runtime-uploaded user content (avatars, etc.)
 uploads/
+
+# Local-only dev DB (Docker) — never pushed
+docker-compose.local.yml
+*.local.sh
+
+# Scratch dir used by the video transcode pipeline (downloads + re-encodes)
+.tmp_transcode/

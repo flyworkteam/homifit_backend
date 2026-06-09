@@ -30,7 +30,19 @@ function parseStrictPositiveInt(value) {
   return null;
 }
 
+function isProduction() {
+  return String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
+}
+
 function isDevAuthEnabled() {
+  // SECURITY: dev auth (the `x-user-id` header) can NEVER be enabled in
+  // production, regardless of how DEV_AUTH_ENABLED / AUTH_MODE are set on
+  // the server. The header lets a request claim any user id with no token,
+  // so we treat "in production" as a hard, code-level kill switch rather
+  // than trusting the deployment to set the env vars correctly.
+  if (isProduction()) {
+    return false;
+  }
   return String(process.env.DEV_AUTH_ENABLED || '').trim().toLowerCase() === 'true';
 }
 
@@ -44,6 +56,14 @@ function getAuthMode() {
 }
 
 function requireDevUser(req, next) {
+  // Defense in depth: this is the single chokepoint every dev-header auth
+  // path funnels through. Hard-ignore the `x-user-id` header in production,
+  // regardless of AUTH_MODE — a misconfigured prod env must never allow
+  // header-based user impersonation.
+  if (isProduction()) {
+    return next(new AppError('Missing bearer token', 401));
+  }
+
   if (!isDevAuthEnabled()) {
     return next(new AppError('Dev auth is not enabled', 503));
   }
@@ -110,12 +130,15 @@ function requireAuth(req, res, next) {
     return requireDevUser(req, next);
   }
 
+  // mode === 'auto': prefer JWT, and only fall back to the dev header
+  // outside production. requireDevUser independently re-checks production,
+  // so even if this branch were reached in prod the header stays ignored.
   const hasBearer = Boolean(parseBearerToken(req.headers.authorization));
   if (hasBearer) {
     return requireJwtUser(req, next);
   }
 
-  if (process.env.NODE_ENV === 'production' || !isDevAuthEnabled()) {
+  if (isProduction() || !isDevAuthEnabled()) {
     return next(new AppError('Missing bearer token', 401));
   }
 

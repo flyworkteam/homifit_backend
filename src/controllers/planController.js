@@ -108,7 +108,16 @@ function validatePlanInput(body) {
     seenWeekday.add(w);
 
     const exercises = Array.isArray(d.exercises) ? d.exercises : [];
-    const cleanExercises = exercises.map((e, eIdx) => {
+    // De-duplicate a day's exercises by slug (falling back to exerciseId)
+    // BEFORE insert — a day must never store the same exercise twice. First
+    // occurrence wins (mirrors the client's own per-day de-dup), and positions
+    // are renumbered contiguously afterward. This is the in-memory guard; the
+    // UNIQUE(day_id, exercise_id) constraint on user_plan_day_exercises is the
+    // DB-level backstop for anything that slips through (e.g. the same exercise
+    // sent once by slug and once by exerciseId).
+    const seenExercise = new Set();
+    const cleanExercises = [];
+    exercises.forEach((e, eIdx) => {
       if (!e || typeof e !== 'object') {
         throw new AppError(`days[${dIdx}].exercises[${eIdx}] must be an object`, 400);
       }
@@ -120,6 +129,10 @@ function validatePlanInput(body) {
           400,
         );
       }
+      const dedupeKey = slug ? `slug:${slug.toLowerCase()}` : `id:${exerciseId}`;
+      if (seenExercise.has(dedupeKey)) return; // duplicate within this day — drop it
+      seenExercise.add(dedupeKey);
+
       const sets = Math.max(1, Math.min(10, Number.parseInt(e.sets, 10) || 3));
       let reps = null;
       let holdSeconds = null;
@@ -130,7 +143,7 @@ function validatePlanInput(body) {
         holdSeconds = Math.max(1, Math.min(900, Number.parseInt(e.holdSeconds, 10) || 0));
       }
       const restSeconds = Math.max(0, Math.min(600, Number.parseInt(e.restSeconds, 10) || 30));
-      return {
+      cleanExercises.push({
         slug,
         exerciseId,
         name: e.name ? String(e.name).slice(0, 160) : null,
@@ -140,8 +153,8 @@ function validatePlanInput(body) {
         reps,
         holdSeconds,
         restSeconds,
-        position: eIdx + 1,
-      };
+        position: cleanExercises.length + 1, // contiguous 1..N after de-dup
+      });
     });
 
     return {
@@ -347,10 +360,20 @@ async function createPlan(req, res, next) {
               conn,
             });
           }
+          // Idempotent insert: if the same (day_id, exercise_id) is attempted
+          // (e.g. a dup that slipped past the in-memory de-dup above), update
+          // the existing row's parameters instead of creating a duplicate. The
+          // row's original position is left intact. Backed by the
+          // UNIQUE(day_id, exercise_id) constraint (migration 008).
           await conn.execute(
             `INSERT INTO user_plan_day_exercises
                (day_id, exercise_id, position, sets, reps, hold_seconds, rest_seconds)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+               sets         = VALUES(sets),
+               reps         = VALUES(reps),
+               hold_seconds = VALUES(hold_seconds),
+               rest_seconds = VALUES(rest_seconds)`,
             [
               dayId,
               exerciseId,
@@ -474,4 +497,6 @@ module.exports = {
   archivePlan,
   deletePlan,
   renamePlan,
+  // Exported for unit testing the per-day exercise de-dup.
+  validatePlanInput,
 };
