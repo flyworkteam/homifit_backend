@@ -30,6 +30,17 @@ const CATEGORY_BY_TOP = {
   'karin-kasi-antrenmani-egzersizleri': 'core_abs',
 };
 
+// Per-template category overrides. Their CDN folder lives under populer/gunluk/
+// genel-antremanlar, but they are ab/core workouts and belong in the
+// "Core & Abs" (core_abs) section per the design — otherwise that section only
+// has 2 cards. Keep in sync with
+// migrations/sql/009_recategorize_core_abs_templates.sql.
+const CATEGORY_OVERRIDE = {
+  'baklava-karin-kasi-egzersizi': 'core_abs',
+  'karin-ve-core-guclendirme': 'core_abs',
+  'core-ve-karin-antrenmani': 'core_abs',
+};
+
 // Map slug → user-facing Turkish title (uses canonical names from the design).
 const TITLE_TR = {
   // Popüler
@@ -163,8 +174,11 @@ async function main() {
       const { top, sub, items } = group;
       if (items.length === 0) continue;
 
-      const category = CATEGORY_BY_TOP[top] || top.replace(/[^a-z0-9]+/g, '_');
       const slug = sub.replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
+      const category =
+        CATEGORY_OVERRIDE[slug] ||
+        CATEGORY_BY_TOP[top] ||
+        top.replace(/[^a-z0-9]+/g, '_');
       const titleTr = TITLE_TR[slug] || prettify(slug);
       const titleEn = TITLE_EN[slug] || prettify(slug);
       const level = levelFor(slug);
