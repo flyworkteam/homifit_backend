@@ -1,5 +1,15 @@
 const AppError = require('../utils/appError');
 const { pool } = require('../config/db');
+const bunnyCdn = require('../config/bunnyCdn');
+
+function thumbUrl(path) {
+  if (!path) return null;
+  try {
+    return bunnyCdn.buildPullUrl(path);
+  } catch (_) {
+    return null;
+  }
+}
 
 function isoDate(d) {
   if (typeof d === 'string') return d.slice(0, 10);
@@ -246,12 +256,254 @@ async function getSummary(req, res, next) {
       [req.userId],
     );
 
+    // SUM()/COALESCE come back as strings via the driver — coerce to numbers
+    // so the client doesn't have to defensively parse (and so old clients that
+    // `as num`-cast don't collapse to zero).
     res.json({
       success: true,
       data: {
-        last7Days:  { workouts: weekRows[0].workouts,  minutes: weekRows[0].minutes },
-        last30Days: { workouts: monthRows[0].workouts, minutes: monthRows[0].minutes },
-        allTime:    { workouts: allRows[0].workouts,   minutes: allRows[0].minutes },
+        last7Days:  { workouts: Number(weekRows[0].workouts),  minutes: Number(weekRows[0].minutes) },
+        last30Days: { workouts: Number(monthRows[0].workouts), minutes: Number(monthRows[0].minutes) },
+        allTime:    { workouts: Number(allRows[0].workouts),   minutes: Number(allRows[0].minutes) },
+      },
+      error: null,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+// ── Stats screen (Profile → Your Stats, Figma 2539:2767) ──────────────────
+// One aggregation call powering the whole screen. Everything is derived from
+// the existing streak_log / workout_sessions / template tables — no new
+// schema. `range` shifts the totals + muscle-focus window; the weekly digest
+// and personal records stay fixed (this-week / lifetime) by design.
+
+/** Midnight (local) of the range start: week=Mon of ISO week, month=-29d, year=-364d. */
+function rangeStartDate(range) {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  if (range === 'year') {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 364);
+    return d;
+  }
+  if (range === 'month') {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 29);
+    return d;
+  }
+  // week → Monday of the current ISO week (matches the digest window).
+  const dow = now.getDay(); // 0=Sun..6=Sat
+  const offsetToMon = dow === 0 ? 6 : dow - 1;
+  const d = new Date(now);
+  d.setDate(d.getDate() - offsetToMon);
+  return d;
+}
+
+/** Walk every logged day ASC and return the longest consecutive run + its span. */
+async function computeLongestStreakSpan(userId) {
+  const [rows] = await pool.execute(
+    `SELECT log_date FROM streak_log WHERE user_id = ? ORDER BY log_date ASC`,
+    [userId],
+  );
+  if (rows.length === 0) return { days: 0, startDate: null, endDate: null };
+
+  let bestLen = 0;
+  let bestStart = null;
+  let bestEnd = null;
+  let curLen = 0;
+  let curStart = null;
+  let prevDate = null; // Date object at midnight
+
+  for (const row of rows) {
+    const ds = isoDate(row.log_date);
+    if (prevDate) {
+      const expected = new Date(prevDate);
+      expected.setDate(expected.getDate() + 1);
+      if (isoDate(expected) === ds) {
+        curLen += 1;
+      } else {
+        curLen = 1;
+        curStart = ds;
+      }
+    } else {
+      curLen = 1;
+      curStart = ds;
+    }
+    if (curLen > bestLen) {
+      bestLen = curLen;
+      bestStart = curStart;
+      bestEnd = ds;
+    }
+    prevDate = new Date(`${ds}T00:00:00`);
+  }
+  return { days: bestLen, startDate: bestStart, endDate: bestEnd };
+}
+
+async function getStats(req, res, next) {
+  try {
+    const userId = req.userId;
+    const rangeRaw = String(req.query.range || 'week').toLowerCase();
+    const range = ['week', 'month', 'year'].includes(rangeRaw) ? rangeRaw : 'week';
+    const startStr = isoDate(rangeStartDate(range));
+
+    // Current ISO week (Mon..Sun) for the fixed weekly digest.
+    const now = new Date();
+    const dow = now.getDay();
+    const offsetToMon = dow === 0 ? 6 : dow - 1;
+    const monday = new Date(now);
+    monday.setHours(0, 0, 0, 0);
+    monday.setDate(monday.getDate() - offsetToMon);
+    const weekDays = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(monday);
+      d.setDate(d.getDate() + i);
+      weekDays.push(isoDate(d));
+    }
+
+    // ── Weekly digest: per-weekday minutes for the current week. ──
+    const wkPlaceholders = weekDays.map(() => '?').join(',');
+    const [digestRows] = await pool.execute(
+      `SELECT log_date, minutes_done, workouts_done
+         FROM streak_log
+        WHERE user_id = ? AND log_date IN (${wkPlaceholders})`,
+      [userId, ...weekDays],
+    );
+    const digestByDate = new Map(
+      digestRows.map((r) => [isoDate(r.log_date), r]),
+    );
+    const digest = weekDays.map((d, i) => {
+      const row = digestByDate.get(d);
+      const minutes = row ? Number(row.minutes_done) || 0 : 0;
+      return { weekday: i, minutes, active: minutes > 0 };
+    });
+
+    // ── Totals over the selected range. ──
+    const [totalRows] = await pool.execute(
+      `SELECT COALESCE(SUM(workouts_done),0) AS workouts,
+              COALESCE(SUM(minutes_done),0)  AS minutes
+         FROM streak_log
+        WHERE user_id = ? AND log_date >= ?`,
+      [userId, startStr],
+    );
+    const workouts = Number(totalRows[0].workouts) || 0;
+    const activeMinutes = Number(totalRows[0].minutes) || 0;
+
+    const [sessRows] = await pool.execute(
+      `SELECT COALESCE(SUM(calories_kcal),0) AS kcal,
+              COALESCE(AVG(NULLIF(duration_sec,0)),0) AS avg_sec
+         FROM workout_sessions
+        WHERE user_id = ? AND completed_at IS NOT NULL
+          AND completed_at >= CONCAT(?, ' 00:00:00')`,
+      [userId, startStr],
+    );
+    let calories = Number(sessRows[0].kcal) || 0;
+    if (calories === 0) calories = activeMinutes * 7; // ~7 kcal/min estimate
+    const avgSessionSec = Math.round(Number(sessRows[0].avg_sec) || 0);
+
+    // ── Weekly goal ring (always the current ISO week). ──
+    const [cntRows] = await pool.execute(
+      `SELECT weekly_done, weekly_goal FROM user_streak_counters WHERE user_id = ? LIMIT 1`,
+      [userId],
+    );
+    const goalDone = cntRows[0] ? Number(cntRows[0].weekly_done) || 0 : 0;
+    const goalTarget = cntRows[0] ? Number(cntRows[0].weekly_goal) || 5 : 5;
+    const goalPercent = goalTarget > 0
+      ? Math.min(100, Math.round((goalDone / goalTarget) * 100))
+      : 0;
+
+    const [planRows] = await pool.execute(
+      `SELECT title FROM user_plans
+        WHERE user_id = ? AND is_active = 1 AND is_archived = 0
+        ORDER BY updated_at DESC LIMIT 1`,
+      [userId],
+    );
+    const planTitle = planRows[0] ? planRows[0].title : null;
+
+    // ── Muscle focus (sets per primary_muscle) over the range. Combine
+    //    template-based quick workouts and plan-day workouts. ──
+    const [tplMuscle] = await pool.execute(
+      `SELECT e.primary_muscle AS muscle, COALESCE(SUM(wte.sets),0) AS sets
+         FROM workout_sessions ws
+         JOIN workout_template_exercises wte ON wte.template_id = ws.template_id
+         JOIN exercises e ON e.id = wte.exercise_id
+        WHERE ws.user_id = ? AND ws.completed_at IS NOT NULL
+          AND ws.completed_at >= CONCAT(?, ' 00:00:00')
+          AND ws.template_id IS NOT NULL AND e.primary_muscle IS NOT NULL
+        GROUP BY e.primary_muscle`,
+      [userId, startStr],
+    );
+    const [planMuscle] = await pool.execute(
+      `SELECT e.primary_muscle AS muscle, COALESCE(SUM(pde.sets),0) AS sets
+         FROM workout_sessions ws
+         JOIN user_plan_day_exercises pde ON pde.day_id = ws.plan_day_id
+         JOIN exercises e ON e.id = pde.exercise_id
+        WHERE ws.user_id = ? AND ws.completed_at IS NOT NULL
+          AND ws.completed_at >= CONCAT(?, ' 00:00:00')
+          AND ws.plan_day_id IS NOT NULL AND e.primary_muscle IS NOT NULL
+        GROUP BY e.primary_muscle`,
+      [userId, startStr],
+    );
+    const muscleMap = new Map();
+    for (const r of [...tplMuscle, ...planMuscle]) {
+      const key = String(r.muscle);
+      muscleMap.set(key, (muscleMap.get(key) || 0) + (Number(r.sets) || 0));
+    }
+    const muscleFocus = [...muscleMap.entries()]
+      .map(([muscle, sets]) => ({ muscle, sets }))
+      .sort((a, b) => b.sets - a.sets)
+      .slice(0, 6);
+
+    // ── Personal records (lifetime). ──
+    const longestStreak = await computeLongestStreakSpan(userId);
+
+    const [longSessRows] = await pool.execute(
+      `SELECT ws.duration_sec, ws.template_id, t.slug AS template_slug,
+              t.title_en, t.title_tr
+         FROM workout_sessions ws
+         LEFT JOIN workout_templates t ON t.id = ws.template_id
+        WHERE ws.user_id = ? AND ws.duration_sec IS NOT NULL AND ws.duration_sec > 0
+        ORDER BY ws.duration_sec DESC LIMIT 1`,
+      [userId],
+    );
+    const ls = longSessRows[0];
+    const longestSession = ls
+      ? {
+          sec: Number(ls.duration_sec) || 0,
+          templateSlug: ls.template_slug || null,
+          titleEn: ls.title_en || null,
+          titleTr: ls.title_tr || null,
+        }
+      : null;
+
+    const [calRows] = await pool.execute(
+      `SELECT MAX(calories_kcal) AS kcal FROM workout_sessions
+        WHERE user_id = ? AND calories_kcal IS NOT NULL`,
+      [userId],
+    );
+    const mostCalories = calRows[0] && calRows[0].kcal != null
+      ? Number(calRows[0].kcal)
+      : 0;
+
+    res.json({
+      success: true,
+      data: {
+        range,
+        digest,
+        totals: { workouts, activeMinutes, calories, avgSessionSec },
+        weeklyGoal: {
+          done: goalDone,
+          goal: goalTarget,
+          percent: goalPercent,
+          planTitle,
+        },
+        muscleFocus,
+        records: {
+          longestStreak,
+          longestSession,
+          mostCalories,
+        },
       },
       error: null,
     });
@@ -326,9 +578,218 @@ async function getStreak(req, res, next) {
   }
 }
 
+// ── Workout History list (Profile → Workout History, Figma 2516:2232) ──────
+
+async function getHistory(req, res, next) {
+  try {
+    const userId = req.userId;
+
+    const [totRows] = await pool.execute(
+      `SELECT COUNT(*) AS workouts,
+              COALESCE(SUM(duration_sec),0) AS total_sec,
+              COALESCE(SUM(calories_kcal),0) AS total_kcal,
+              COALESCE(SUM(minutes_from_dur),0) AS total_min
+         FROM (
+           SELECT duration_sec, calories_kcal,
+                  ROUND(COALESCE(duration_sec,0)/60) AS minutes_from_dur
+             FROM workout_sessions
+            WHERE user_id=? AND completed_at IS NOT NULL
+         ) s`,
+      [userId],
+    );
+    const tot = totRows[0] || {};
+
+    const [rows] = await pool.execute(
+      `SELECT ws.id, ws.completed_at, ws.duration_sec, ws.calories_kcal,
+              ws.exercises_total,
+              ws.template_id, ws.plan_day_id, ws.plan_id,
+              t.title_en AS t_en, t.title_tr AS t_tr, t.slug AS t_slug,
+              t.thumbnail_path AS t_thumb,
+              pd.title AS day_title, p.title AS plan_title,
+              COALESCE(NULLIF(ws.exercises_total,0),
+                (SELECT COUNT(*) FROM workout_template_exercises wte WHERE wte.template_id=ws.template_id),
+                (SELECT COUNT(*) FROM user_plan_day_exercises pde WHERE pde.day_id=ws.plan_day_id),
+                0) AS exercise_count
+         FROM workout_sessions ws
+         LEFT JOIN workout_templates t ON t.id = ws.template_id
+         LEFT JOIN user_plan_days pd ON pd.id = ws.plan_day_id
+         LEFT JOIN user_plans p ON p.id = ws.plan_id
+        WHERE ws.user_id=? AND ws.completed_at IS NOT NULL
+        ORDER BY ws.completed_at DESC
+        LIMIT 50`,
+      [userId],
+    );
+
+    const sessions = rows.map((r) => {
+      const durSec = Number(r.duration_sec) || 0;
+      let kcal = r.calories_kcal != null ? Number(r.calories_kcal) : 0;
+      if (kcal === 0) kcal = Math.round((durSec / 60) * 7);
+      return {
+        id: r.id,
+        completedAt: r.completed_at, // 'YYYY-MM-DD HH:MM:SS' (dateStrings)
+        titleEn: r.t_en || r.day_title || r.plan_title || null,
+        titleTr: r.t_tr || r.day_title || r.plan_title || null,
+        templateSlug: r.t_slug || null,
+        exerciseCount: Number(r.exercise_count) || 0,
+        durationSec: durSec,
+        calories: kcal,
+        thumbnailUrl: thumbUrl(r.t_thumb),
+      };
+    });
+
+    res.json({
+      success: true,
+      data: {
+        totals: {
+          totalMinutes: Number(tot.total_min) || 0,
+          totalWorkouts: Number(tot.workouts) || 0,
+          totalCalories: Number(tot.total_kcal) || 0,
+        },
+        sessions,
+      },
+      error: null,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+// ── Single session detail (Workout Summary, Figma 2516:2410) ────────────────
+
+async function getSessionDetail(req, res, next) {
+  try {
+    const userId = req.userId;
+    const id = Number.parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) {
+      throw new AppError('Invalid session id', 400);
+    }
+
+    const [sRows] = await pool.execute(
+      `SELECT ws.id, ws.completed_at, ws.duration_sec, ws.calories_kcal,
+              ws.exercises_total, ws.template_id, ws.plan_day_id, ws.plan_id,
+              t.title_en AS t_en, t.title_tr AS t_tr, t.slug AS t_slug,
+              t.level AS t_level, t.duration_min AS t_dur,
+              pd.title AS day_title, p.title AS plan_title,
+              p.level AS p_level, p.duration_min AS p_dur, p.equipment_enabled AS p_equip
+         FROM workout_sessions ws
+         LEFT JOIN workout_templates t ON t.id = ws.template_id
+         LEFT JOIN user_plan_days pd ON pd.id = ws.plan_day_id
+         LEFT JOIN user_plans p ON p.id = ws.plan_id
+        WHERE ws.id=? AND ws.user_id=? LIMIT 1`,
+      [id, userId],
+    );
+    const s = sRows[0];
+    if (!s) throw new AppError('Session not found', 404);
+
+    // Exercises performed — from the template or the plan day.
+    let moveRows = [];
+    if (s.template_id) {
+      const [r] = await pool.execute(
+        `SELECT e.slug, e.name_en, e.name_tr, e.primary_muscle, e.secondary_muscles,
+                e.unit, wte.sets, wte.reps, wte.hold_seconds, wte.position
+           FROM workout_template_exercises wte
+           JOIN exercises e ON e.id = wte.exercise_id
+          WHERE wte.template_id=? ORDER BY wte.position`,
+        [s.template_id],
+      );
+      moveRows = r;
+    } else if (s.plan_day_id) {
+      const [r] = await pool.execute(
+        `SELECT e.slug, e.name_en, e.name_tr, e.primary_muscle, e.secondary_muscles,
+                e.unit, pde.sets, pde.reps, pde.hold_seconds, pde.position
+           FROM user_plan_day_exercises pde
+           JOIN exercises e ON e.id = pde.exercise_id
+          WHERE pde.day_id=? ORDER BY pde.position`,
+        [s.plan_day_id],
+      );
+      moveRows = r;
+    }
+
+    const moves = moveRows.map((m) => {
+      let secondary = [];
+      if (m.secondary_muscles) {
+        try {
+          const parsed = typeof m.secondary_muscles === 'string'
+            ? JSON.parse(m.secondary_muscles)
+            : m.secondary_muscles;
+          if (Array.isArray(parsed)) secondary = parsed.map(String);
+        } catch (_) {/* ignore */}
+      }
+      return {
+        slug: m.slug,
+        nameEn: m.name_en,
+        nameTr: m.name_tr,
+        primaryMuscle: m.primary_muscle || null,
+        secondaryMuscles: secondary,
+        unit: m.unit, // 'reps' | 'seconds'
+        sets: Number(m.sets) || 0,
+        reps: m.reps != null ? Number(m.reps) : null,
+        holdSeconds: m.hold_seconds != null ? Number(m.hold_seconds) : null,
+        done: true,
+      };
+    });
+
+    // Muscle focus + volume (per session).
+    const muscleMap = new Map();
+    let totalSets = 0;
+    let kgMoved = 0;
+    const userWeight = 70; // default estimate for the "shareable win"
+    for (const m of moves) {
+      totalSets += m.sets;
+      if (m.primaryMuscle) {
+        muscleMap.set(m.primaryMuscle,
+          (muscleMap.get(m.primaryMuscle) || 0) + m.sets);
+      }
+      // reps-equivalent for kg-moved estimate (a hold ≈ ~one rep per 3s).
+      const repsEquiv = m.unit === 'seconds'
+        ? Math.max(1, Math.round((m.holdSeconds || 0) / 3))
+        : (m.reps || 0);
+      // ~8% of bodyweight effectively "moved" per rep — lands a typical
+      // bodyweight session in the playful car/animal comparison range.
+      kgMoved += m.sets * repsEquiv * userWeight * 0.08;
+    }
+    const muscleFocus = [...muscleMap.entries()]
+      .map(([muscle, sets]) => ({ muscle, sets }))
+      .sort((a, b) => b.sets - a.sets);
+    const directSets = muscleFocus.length ? muscleFocus[0].sets : 0;
+    const indirectSets = Math.max(0, totalSets - directSets);
+
+    const durSec = Number(s.duration_sec) || 0;
+    let kcal = s.calories_kcal != null ? Number(s.calories_kcal) : 0;
+    if (kcal === 0) kcal = Math.round((durSec / 60) * 7);
+
+    res.json({
+      success: true,
+      data: {
+        id: s.id,
+        completedAt: s.completed_at,
+        titleEn: s.t_en || s.day_title || s.plan_title || null,
+        titleTr: s.t_tr || s.day_title || s.plan_title || null,
+        templateSlug: s.t_slug || null,
+        durationSec: durSec,
+        exerciseCount: moves.length || Number(s.exercises_total) || 0,
+        calories: kcal,
+        level: s.t_level || s.p_level || 'beginner',
+        durationMin: Number(s.t_dur || s.p_dur) || Math.round(durSec / 60),
+        equipment: Boolean(s.p_equip),
+        moves,
+        muscleFocus,
+        volume: { totalSets, directSets, indirectSets },
+        kgMoved: Math.round(kgMoved),
+      },
+      error: null,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
 module.exports = {
   listDays,
   upsertDay,
   getSummary,
   getStreak,
+  getStats,
+  getHistory,
+  getSessionDetail,
 };

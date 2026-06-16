@@ -26,6 +26,7 @@ const MUSCLE_BY_FOLDER = {
   'omuzlar': 'shoulders',
   'gogus': 'chest',
   'sirt': 'back',
+  'omuz-sirt': 'shoulders_back', // combined CDN folder (app's 6-group taxonomy)
   'karin': 'core',
   'karin-kaslari': 'core',
   'bacak': 'legs',
@@ -33,6 +34,9 @@ const MUSCLE_BY_FOLDER = {
   'kalca': 'glutes',
   'tum-vucut': 'full_body',
 };
+// NOTE: the canonical muscle folders (bacak/gogus/karin-kaslari/kol/omuz-sirt/
+// tum-vucut) are also backfilled by migration 010 — keep the two in sync so a
+// re-seed never reverts the Stats screen muscle breakdown.
 
 // Slug → readable English name fallback.
 function prettify(slug) {

@@ -7,6 +7,9 @@ const router = express.Router();
 router.get('/days', requireAuth, controller.listDays);
 router.put('/days/:day', requireAuth, controller.upsertDay);
 router.get('/summary', requireAuth, controller.getSummary);
+router.get('/stats', requireAuth, controller.getStats);
+router.get('/history', requireAuth, controller.getHistory);
+router.get('/sessions/:id', requireAuth, controller.getSessionDetail);
 router.get('/streak', requireAuth, controller.getStreak);
 
 module.exports = router;
