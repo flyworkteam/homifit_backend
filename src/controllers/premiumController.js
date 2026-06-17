@@ -43,19 +43,19 @@ async function getStatus(req, res, next) {
 
 // Per `docs/HomiFit – Premium Paket Özellikleri.docx`:
 //   "HomiFit ilk kez indirildiğinde kullanıcıya sınırlı ücretsiz kullanım
-//    hakkı tanımlanır. (1 gün)"
-// Duration is in milliseconds (1 day).
-const TRIAL_DURATION_MS = 24 * 60 * 60 * 1000;
+//    hakkı tanımlanır."
+// Duration is in milliseconds (3 days).
+const TRIAL_DURATION_MS = 3 * 24 * 60 * 60 * 1000;
 
 /**
- * Start a 1-day backend-managed free trial for the current user. Idempotent:
+ * Start a 3-day backend-managed free trial for the current user. Idempotent:
  *   - If the user already has an active subscription → 400 (no need).
  *   - If a trial was already started (active OR expired) → return the same
  *     `trial_end` and no-op. Free trials are one-shot per user.
  *   - Otherwise insert / update `premium_status` with
  *       is_premium = 1
  *       entitlement = 'trial'
- *       trial_end = NOW + 1 day
+ *       trial_end = NOW + 3 days
  *
  * Called by the client once per install at end-of-onboarding (or on first
  * authenticated launch if the user skipped onboarding).
@@ -144,10 +144,10 @@ async function getPricing(req, res, next) {
     );
 
     // Per `docs/HomiFit – Premium Paket Özellikleri.docx`:
-    // Aylık 1.99 USD, Yıllık 11.99 USD, 1 günlük deneme süresi.
+    // Aylık 1.99 USD, Yıllık 11.99 USD, 3 günlük deneme süresi.
     const baseMonthly = 1.99;
     const baseYearly = 11.99;
-    const trialDays = 1;
+    const trialDays = 3;
 
     const monthly = discountActive
       ? Math.round(baseMonthly * (100 - discountPct)) / 100
