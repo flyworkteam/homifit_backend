@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const AppError = require('../utils/appError');
 const { pool } = require('../config/db');
+const { isEffectivelyPremium } = require('../utils/premium');
 
 function parseBearerToken(authorization) {
   if (!authorization || typeof authorization !== 'string') {
@@ -155,9 +156,9 @@ function requireAuth(req, res, next) {
  *   { isPremium: bool, entitlement, productId, currentPeriodEnd, trialEnd,
  *     cancelledAt, promoDiscountPct }
  *
- * Trial detection: a user with `is_premium=0` but `trial_end > NOW()` is
- * still treated as premium (the backend-managed trial sets is_premium=1
- * anyway; this is a safety net for legacy rows).
+ * Trial handling: a backend-managed free trial sets `is_premium=1` but never
+ * resets it on expiry, so `isEffectivelyPremium` gates trial rows on the live
+ * `trial_end` window instead of trusting the sticky flag (see utils/premium).
  */
 async function loadPremium(req, res, next) {
   void res;
@@ -175,11 +176,8 @@ async function loadPremium(req, res, next) {
       [req.userId],
     );
     const r = rows[0];
-    const now = Date.now();
-    const trialActive =
-      r && r.trial_end && new Date(r.trial_end).getTime() > now;
     req.premium = {
-      isPremium: Boolean(r && (r.is_premium || trialActive)),
+      isPremium: isEffectivelyPremium(r),
       entitlement: r ? r.entitlement : null,
       productId: r ? r.product_id : null,
       currentPeriodEnd: r ? r.current_period_end : null,

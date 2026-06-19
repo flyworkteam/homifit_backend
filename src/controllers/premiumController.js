@@ -1,6 +1,7 @@
 const crypto = require('node:crypto');
 const AppError = require('../utils/appError');
 const { pool } = require('../config/db');
+const { isEffectivelyPremium } = require('../utils/premium');
 
 function rowToStatus(r) {
   if (!r) {
@@ -17,7 +18,9 @@ function rowToStatus(r) {
     };
   }
   return {
-    isPremium: Boolean(r.is_premium),
+    // Effective premium: a backend trial keeps is_premium=1 forever, so gate
+    // trial rows on the live trial_end window (see utils/premium).
+    isPremium: isEffectivelyPremium(r),
     entitlement: r.entitlement,
     productId: r.product_id,
     store: r.store,
