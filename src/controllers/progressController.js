@@ -11,6 +11,35 @@ function thumbUrl(path) {
   }
 }
 
+/**
+ * Batch-load the first exercise (lowest position) for a set of join-table
+ * groups, so each history row can show a real per-exercise image — the same
+ * gendered-photo / video-poster source the rest of the app uses — instead of
+ * the (almost always NULL) `workout_templates.thumbnail_path`.
+ *
+ * @param {string} joinTable  'workout_template_exercises' | 'user_plan_day_exercises'
+ * @param {string} groupCol   'template_id' | 'day_id'
+ * @returns {Promise<Map<number,{slug:string, videoUrl:string|null}>>}
+ */
+async function loadFirstExercise(joinTable, groupCol, ids) {
+  if (!ids.length) return new Map();
+  const ph = ids.map(() => '?').join(',');
+  const [rows] = await pool.execute(
+    `SELECT j.${groupCol} AS gid, e.slug, e.video_url, e.video_cdn_path
+       FROM ${joinTable} j
+       JOIN exercises e ON e.id = j.exercise_id
+      WHERE j.${groupCol} IN (${ph})
+      ORDER BY j.${groupCol}, j.position`,
+    ids,
+  );
+  const map = new Map();
+  for (const r of rows) {
+    if (map.has(r.gid)) continue; // first row per group = lowest position
+    map.set(r.gid, { slug: r.slug, videoUrl: r.video_url || thumbUrl(r.video_cdn_path) });
+  }
+  return map;
+}
+
 function isoDate(d) {
   if (typeof d === 'string') return d.slice(0, 10);
   // Format in the local timezone — MariaDB stores DATE as wall-clock and we
@@ -620,10 +649,23 @@ async function getHistory(req, res, next) {
       [userId],
     );
 
+    // Per-session image source: first exercise of the template or plan day.
+    const tplIds = [...new Set(rows.filter((r) => r.template_id).map((r) => r.template_id))];
+    const dayIds = [...new Set(
+      rows.filter((r) => !r.template_id && r.plan_day_id).map((r) => r.plan_day_id),
+    )];
+    const [tplFirst, dayFirst] = await Promise.all([
+      loadFirstExercise('workout_template_exercises', 'template_id', tplIds),
+      loadFirstExercise('user_plan_day_exercises', 'day_id', dayIds),
+    ]);
+
     const sessions = rows.map((r) => {
       const durSec = Number(r.duration_sec) || 0;
       let kcal = r.calories_kcal != null ? Number(r.calories_kcal) : 0;
       if (kcal === 0) kcal = Math.round((durSec / 60) * 7);
+      const firstEx = r.template_id
+        ? tplFirst.get(r.template_id)
+        : (r.plan_day_id ? dayFirst.get(r.plan_day_id) : null);
       return {
         id: r.id,
         completedAt: r.completed_at, // 'YYYY-MM-DD HH:MM:SS' (dateStrings)
@@ -634,6 +676,10 @@ async function getHistory(req, res, next) {
         durationSec: durSec,
         calories: kcal,
         thumbnailUrl: thumbUrl(r.t_thumb),
+        // First exercise → lets the client render the user's gendered demo
+        // photo (or the video poster frame) when the template thumb is NULL.
+        exerciseSlug: firstEx ? firstEx.slug : null,
+        exerciseVideoUrl: firstEx ? firstEx.videoUrl : null,
       };
     });
 
