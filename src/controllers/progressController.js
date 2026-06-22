@@ -25,7 +25,8 @@ async function loadFirstExercise(joinTable, groupCol, ids) {
   if (!ids.length) return new Map();
   const ph = ids.map(() => '?').join(',');
   const [rows] = await pool.execute(
-    `SELECT j.${groupCol} AS gid, e.slug, e.video_url, e.video_cdn_path
+    `SELECT j.${groupCol} AS gid, e.slug, e.video_url, e.video_cdn_path,
+            e.primary_muscle
        FROM ${joinTable} j
        JOIN exercises e ON e.id = j.exercise_id
       WHERE j.${groupCol} IN (${ph})
@@ -35,7 +36,11 @@ async function loadFirstExercise(joinTable, groupCol, ids) {
   const map = new Map();
   for (const r of rows) {
     if (map.has(r.gid)) continue; // first row per group = lowest position
-    map.set(r.gid, { slug: r.slug, videoUrl: r.video_url || thumbUrl(r.video_cdn_path) });
+    map.set(r.gid, {
+      slug: r.slug,
+      videoUrl: r.video_url || thumbUrl(r.video_cdn_path),
+      primaryMuscle: r.primary_muscle || null,
+    });
   }
   return map;
 }
@@ -680,6 +685,10 @@ async function getHistory(req, res, next) {
         // photo (or the video poster frame) when the template thumb is NULL.
         exerciseSlug: firstEx ? firstEx.slug : null,
         exerciseVideoUrl: firstEx ? firstEx.videoUrl : null,
+        // Primary muscle of the session's first exercise → the client picks the
+        // matching 3D focus emoji (Figma 2516:2232 row thumbnail). NULL for an
+        // empty/exercise-less session → client falls back to the full-body emoji.
+        primaryMuscle: firstEx ? firstEx.primaryMuscle : null,
       };
     });
 
