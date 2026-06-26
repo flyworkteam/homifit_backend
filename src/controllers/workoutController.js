@@ -366,14 +366,29 @@ async function getTemplate(req, res, next) {
       success: true,
       data: {
         template: rowToTemplate(t, locale, null, { isPremiumUser }),
-        exercises: exercises.map((row) => ({
-          ...rowToExercise(row, locale),
-          position: row.position,
-          sets: row.sets,
-          reps: row.reps,
-          holdSeconds: row.hold_seconds,
-          restSeconds: row.rest_seconds,
-        })),
+        exercises: exercises.map((row) => {
+          // Prefer the template's explicit prescription; when it isn't set,
+          // fall back to the exercise's own per-move defaults (unit + value +
+          // sets) so each move shows realistic, distinct sets/reps instead of
+          // a uniform 3×12.
+          let reps = row.reps;
+          let holdSeconds = row.hold_seconds;
+          if (reps == null && holdSeconds == null) {
+            if (row.unit === 'seconds') {
+              holdSeconds = row.default_value ?? 30;
+            } else {
+              reps = row.default_value ?? 12;
+            }
+          }
+          return {
+            ...rowToExercise(row, locale),
+            position: row.position,
+            sets: row.sets ?? row.default_sets ?? 3,
+            reps,
+            holdSeconds,
+            restSeconds: row.rest_seconds,
+          };
+        }),
       },
       error: null,
     });

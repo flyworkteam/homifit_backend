@@ -11,9 +11,13 @@
  * Rule:
  *   - Trial rows (`entitlement = 'trial'`): premium ONLY while the live trial
  *     window is open (`trial_end > NOW`). Never trust the sticky flag.
- *   - Everything else (paid subscriptions maintained by the RevenueCat
- *     webhook, which flips `is_premium` to 0 on EXPIRATION/CANCELLATION):
- *     honor `is_premium`, plus any still-live trial window as a safety net.
+ *   - Paid subscriptions: honor `is_premium`, BUT if a billing period end is
+ *     known (`current_period_end`) it must still be in the future. This guards
+ *     against a missed/failed EXPIRATION webhook leaving `is_premium` stuck at
+ *     1 forever — a lapsed paid user should lose access the moment their period
+ *     ends, even if RevenueCat never told us. A NULL `current_period_end` means
+ *     a non-expiring grant (lifetime / NON_RENEWING_PURCHASE) and is honored.
+ *   - A still-live trial window always acts as a safety net on top.
  *
  * @param {object|null} r  A `premium_status` row (snake_case columns) or null.
  * @param {number} [nowMs] Current time in ms (injectable for tests).
@@ -24,7 +28,13 @@ function isEffectivelyPremium(r, nowMs = Date.now()) {
   const trialActive =
     r.trial_end != null && new Date(r.trial_end).getTime() > nowMs;
   if (r.entitlement === 'trial') return trialActive;
-  return Boolean(r.is_premium) || trialActive;
+
+  // Paid/other rows: a known period end must not be in the past.
+  const periodActive =
+    r.current_period_end == null ||
+    new Date(r.current_period_end).getTime() > nowMs;
+  if (Boolean(r.is_premium) && periodActive) return true;
+  return trialActive;
 }
 
 module.exports = { isEffectivelyPremium };

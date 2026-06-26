@@ -10,6 +10,10 @@ router.get('/pricing', requireAuth, controller.getPricing);
 // kullanıcıya sınırlı ücretsiz kullanım hakkı tanımlanır.").
 // Idempotent / one-shot per user — see controller for semantics.
 router.post('/start-trial', requireAuth, controller.startTrial);
+// Instant post-purchase sync: pulls the RevenueCat subscriber state for the
+// caller and upserts it, so paid content unlocks without waiting for the
+// async webhook. Falls back to the webhook-written state when RC isn't keyed.
+router.post('/sync', requireAuth, controller.syncFromStore);
 router.post('/webhook', controller.revenueCatWebhook);
 
 module.exports = router;

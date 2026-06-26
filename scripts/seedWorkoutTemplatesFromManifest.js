@@ -160,8 +160,12 @@ async function main() {
     database: process.env.DB_NAME,
   });
 
-  // Pre-load exercise id lookup by slug.
-  const [allEx] = await conn.execute('SELECT id, slug, name_en, name_tr FROM exercises');
+  // Pre-load exercise id lookup by slug (incl. per-move prescription defaults so
+  // each template row gets realistic sets / reps-or-hold instead of a uniform
+  // 3×12 — run scripts/backfillExerciseDefaults.js first to populate these).
+  const [allEx] = await conn.execute(
+    'SELECT id, slug, name_en, name_tr, unit, default_value, default_sets FROM exercises',
+  );
   const exBySlug = new Map(allEx.map((r) => [r.slug, r]));
 
   let inserted = 0;
@@ -234,11 +238,17 @@ async function main() {
           exRow = { id: insEx.insertId, slug: it.exerciseSlug, name_en: niceName, name_tr: null };
           exBySlug.set(it.exerciseSlug, exRow);
         }
+        // Derive the prescription from the exercise's own defaults so moves vary
+        // (a plank gets a hold in seconds, a squat gets reps, etc.).
+        const isHold = exRow.unit === 'seconds';
+        const sets = exRow.default_sets ?? 3;
+        const reps = isHold ? null : (exRow.default_value ?? 12);
+        const holdSeconds = isHold ? (exRow.default_value ?? 30) : null;
         await conn.execute(
           `INSERT INTO workout_template_exercises
              (template_id, exercise_id, position, sets, reps, hold_seconds, rest_seconds)
-           VALUES (?, ?, ?, 3, 12, NULL, 30)`,
-          [templateId, exRow.id, position++],
+           VALUES (?, ?, ?, ?, ?, ?, 30)`,
+          [templateId, exRow.id, position++, sets, reps, holdSeconds],
         );
         totalLinked += 1;
       }

@@ -450,12 +450,39 @@ async function getSummary(req, res, next) {
       [req.userId],
     );
 
+    // Today's bucket powers the Home "Calories burned today" tile with REAL
+    // calories from completed sessions (falling back to a ~7 kcal/min estimate
+    // only when a session didn't record calories).
+    const [todayRows] = await pool.execute(
+      `SELECT COALESCE(SUM(workouts_done),0) AS workouts,
+              COALESCE(SUM(minutes_done),0)  AS minutes
+         FROM streak_log
+        WHERE user_id = ? AND log_date = CURDATE()`,
+      [req.userId],
+    );
+    const [todayKcalRows] = await pool.execute(
+      `SELECT COALESCE(SUM(calories_kcal),0) AS kcal
+         FROM workout_sessions
+        WHERE user_id = ? AND completed_at IS NOT NULL
+          AND completed_at >= CURDATE()`,
+      [req.userId],
+    );
+    const todayMinutes = Number(todayRows[0].minutes) || 0;
+    const todayWorkouts = Number(todayRows[0].workouts) || 0;
+    let todayCalories = Number(todayKcalRows[0].kcal) || 0;
+    if (todayCalories === 0) todayCalories = todayMinutes * 7;
+
     // SUM()/COALESCE come back as strings via the driver — coerce to numbers
     // so the client doesn't have to defensively parse (and so old clients that
     // `as num`-cast don't collapse to zero).
     res.json({
       success: true,
       data: {
+        today: {
+          workouts: todayWorkouts,
+          minutes: todayMinutes,
+          calories: todayCalories,
+        },
         last7Days:  { workouts: Number(weekRows[0].workouts),  minutes: Number(weekRows[0].minutes) },
         last30Days: { workouts: Number(monthRows[0].workouts), minutes: Number(monthRows[0].minutes) },
         allTime:    { workouts: Number(allRows[0].workouts),   minutes: Number(allRows[0].minutes) },

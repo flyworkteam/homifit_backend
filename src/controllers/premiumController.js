@@ -2,6 +2,7 @@ const crypto = require('node:crypto');
 const AppError = require('../utils/appError');
 const { pool } = require('../config/db');
 const { isEffectivelyPremium } = require('../utils/premium');
+const rcService = require('../services/revenueCatService');
 
 function rowToStatus(r) {
   if (!r) {
@@ -52,19 +53,29 @@ const TRIAL_DURATION_MS = 3 * 24 * 60 * 60 * 1000;
 
 /**
  * Start a 3-day backend-managed free trial for the current user. Idempotent:
- *   - If the user already has an active subscription → 400 (no need).
+ *   - If the user already has an active subscription → no-op.
  *   - If a trial was already started (active OR expired) → return the same
  *     `trial_end` and no-op. Free trials are one-shot per user.
+ *   - If the DEVICE already seeded a trial for a DIFFERENT account → no-op
+ *     (`trialDeviceLimit: true`). One device can only ever activate the trial
+ *     for a single account, which blocks "new account = new trial" farming.
  *   - Otherwise insert / update `premium_status` with
  *       is_premium = 1
  *       entitlement = 'trial'
  *       trial_end = NOW + 3 days
+ *     and claim the device in `premium_trial_devices`.
  *
  * Called by the client once per install at end-of-onboarding (or on first
- * authenticated launch if the user skipped onboarding).
+ * authenticated launch if the user skipped onboarding). The client sends a
+ * stable `deviceId` in the body so the device gate can be enforced; older
+ * clients that omit it fall back to the per-user one-shot behaviour.
  */
 async function startTrial(req, res, next) {
   try {
+    const deviceId = typeof req.body?.deviceId === 'string'
+      ? req.body.deviceId.trim().slice(0, 191)
+      : '';
+
     const [rows] = await pool.execute(
       'SELECT * FROM premium_status WHERE user_id = ? LIMIT 1',
       [req.userId],
@@ -89,6 +100,43 @@ async function startTrial(req, res, next) {
         data: { ...rowToStatus(existing), trialAlreadyUsed: true },
         error: null,
       });
+    }
+
+    // Device gate: a device can seed a trial for only ONE account. Claiming the
+    // device is an atomic INSERT on the PK — the first account wins. (Skipped
+    // when the client didn't send a deviceId, e.g. older builds.)
+    if (deviceId) {
+      let claimed = false;
+      try {
+        const [ins] = await pool.execute(
+          'INSERT INTO premium_trial_devices (device_id, user_id) VALUES (?, ?)',
+          [deviceId, req.userId],
+        );
+        claimed = ins.affectedRows === 1;
+      } catch (err) {
+        if (err && err.code === 'ER_DUP_ENTRY') {
+          claimed = false;
+        } else {
+          throw err;
+        }
+      }
+
+      if (!claimed) {
+        const [owner] = await pool.execute(
+          'SELECT user_id FROM premium_trial_devices WHERE device_id = ? LIMIT 1',
+          [deviceId],
+        );
+        const ownerId = owner[0] ? Number(owner[0].user_id) : null;
+        if (ownerId !== Number(req.userId)) {
+          // A different account already used the trial on this device.
+          return res.json({
+            success: true,
+            data: { ...rowToStatus(existing), trialDeviceLimit: true },
+            error: null,
+          });
+        }
+        // Same user re-claiming (e.g. premium_status was reset) → allow grant.
+      }
     }
 
     const now = new Date();
@@ -179,6 +227,73 @@ async function getPricing(req, res, next) {
   }
 }
 
+/**
+ * Pull the authoritative subscriber state from RevenueCat for the CURRENT user
+ * and upsert it into `premium_status`, then return the effective status.
+ *
+ * Why: after a purchase the RevenueCat SDK grants the entitlement on-device
+ * instantly, but our backend only learns about it via the asynchronous webhook,
+ * which can lag a few seconds. The client calls this right after a successful
+ * purchase/restore so paid content unlocks immediately. The webhook stays the
+ * source of truth for later renewals/expirations.
+ *
+ * Degrades gracefully: when no RevenueCat secret key (REVENUECAT_API_KEY) is
+ * configured, or the user has no Firebase uid, it skips the remote pull and
+ * just returns whatever the webhook already wrote (so client-side polling can
+ * still catch the webhook landing).
+ */
+async function syncFromStore(req, res, next) {
+  try {
+    // The RC app user id == the user's Firebase uid (see client identify()).
+    let appUserId = req.firebaseUid || null;
+    if (!appUserId) {
+      const [urows] = await pool.execute(
+        'SELECT firebase_uid FROM users WHERE id = ? LIMIT 1',
+        [req.userId],
+      );
+      appUserId = urows[0]?.firebase_uid || null;
+    }
+
+    if (rcService.isConfigured() && appUserId) {
+      const subscriber = await rcService.fetchSubscriber(appUserId);
+      const derived = rcService.deriveStatus(subscriber);
+      if (derived && derived.isPremium) {
+        await pool.execute(
+          `INSERT INTO premium_status
+             (user_id, is_premium, entitlement, product_id, store,
+              current_period_start, current_period_end, original_app_user_id)
+           VALUES (?, 1, ?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             is_premium = 1,
+             entitlement = VALUES(entitlement),
+             product_id = VALUES(product_id),
+             store = COALESCE(VALUES(store), store),
+             current_period_start = VALUES(current_period_start),
+             current_period_end = VALUES(current_period_end),
+             original_app_user_id = VALUES(original_app_user_id)`,
+          [
+            req.userId,
+            derived.entitlement,
+            derived.productId,
+            derived.store,
+            derived.currentPeriodStart,
+            derived.currentPeriodEnd,
+            appUserId,
+          ],
+        );
+      }
+    }
+
+    const [rows] = await pool.execute(
+      'SELECT * FROM premium_status WHERE user_id = ? LIMIT 1',
+      [req.userId],
+    );
+    res.json({ success: true, data: rowToStatus(rows[0] || null), error: null });
+  } catch (error) {
+    next(error);
+  }
+}
+
 function timingSafeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   const ab = Buffer.from(a);
@@ -197,10 +312,20 @@ const ACTIVE_EVENTS = new Set([
   'NON_RENEWING_PURCHASE',
 ]);
 
+// Events that revoke access immediately (set is_premium = 0).
+//   - EXPIRATION: the paid-through date passed, access ends now.
+//   - REFUND: purchase was refunded, access is pulled.
+//   - SUBSCRIPTION_PAUSED: (Android) the subscription is paused, no access.
+//
+// Deliberately NOT here (would otherwise revoke access too early):
+//   - CANCELLATION: the user only turned OFF auto-renew; they keep access
+//     until `current_period_end`. We record `cancelled_at` + the period end and
+//     let the period-end gate in utils/premium expire them at the right time.
+//   - BILLING_ISSUE: payment hiccup; the sub usually enters a grace period and
+//     access should continue until it actually EXPIRES. Forcing is_premium=0
+//     here would kick out users who are still in good standing.
 const INACTIVE_EVENTS = new Set([
-  'CANCELLATION',
   'EXPIRATION',
-  'BILLING_ISSUE',
   'SUBSCRIPTION_PAUSED',
   'REFUND',
 ]);
@@ -226,9 +351,20 @@ async function findUserId({ appUserId, email }) {
 
 async function revenueCatWebhook(req, res, next) {
   try {
-    // Verify shared-secret header.
-    const expected = process.env.REVENUECAT_WEBHOOK_SECRET || '';
-    if (expected) {
+    // Verify shared-secret header. The secret is configured in the RevenueCat
+    // dashboard (Webhooks → Authorization header) and mirrored in
+    // REVENUECAT_WEBHOOK_SECRET. In production a missing secret is a hard error
+    // — we must NEVER accept unauthenticated webhooks that can flip a user's
+    // premium state. Outside production an unset secret is allowed so the flow
+    // can be exercised locally.
+    const expected = (process.env.REVENUECAT_WEBHOOK_SECRET || '').trim();
+    const inProd =
+      String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
+    if (!expected) {
+      if (inProd) {
+        throw new AppError('Webhook secret is not configured', 503);
+      }
+    } else {
       const auth = String(req.headers.authorization || '');
       const provided = auth.startsWith('Bearer ')
         ? auth.slice(7).trim()
@@ -331,5 +467,6 @@ module.exports = {
   getStatus,
   getPricing,
   startTrial,
+  syncFromStore,
   revenueCatWebhook,
 };
