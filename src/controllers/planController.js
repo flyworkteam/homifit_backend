@@ -1,6 +1,7 @@
 const AppError = require('../utils/appError');
 const { pool } = require('../config/db');
 const exerciseResolver = require('../services/exerciseResolver');
+const { generateAiPlanDays } = require('../services/aiPlanGenerator');
 const bunny = require('../config/bunnyCdn');
 
 const PLAN_ENUMS = {
@@ -170,7 +171,12 @@ function validatePlanInput(body) {
     goal: pickEnum('goal', PLAN_ENUMS.goal),
     level: pickEnum('level', PLAN_ENUMS.level),
     durationMin: pickInt('durationMin', 5, 240, 20),
-    daysPerWeek: pickInt('daysPerWeek', 1, 7, Math.max(1, cleanDays.length || 1)),
+    // The actual number of day objects is the source of truth — the client's
+    // daysPerWeek hint can be stale (e.g. onboarding always sends 3 while the
+    // generator returns a goal/level-derived count), so prefer the real count.
+    daysPerWeek: cleanDays.length > 0
+      ? Math.max(1, Math.min(7, cleanDays.length))
+      : pickInt('daysPerWeek', 1, 7, 1),
     warmupEnabled: body.warmupEnabled === true,
     stretchingEnabled: body.stretchingEnabled !== false,
     equipmentEnabled: body.equipmentEnabled === true,
@@ -179,6 +185,22 @@ function validatePlanInput(body) {
     isActive: body.isActive !== false,
     days: cleanDays,
   };
+}
+
+async function generatePlanPreview(req, res, next) {
+  try {
+    const days = await generateAiPlanDays({
+      ...req.body,
+      locale: req.locale,
+    });
+    res.json({
+      success: true,
+      data: { days },
+      error: null,
+    });
+  } catch (error) {
+    next(error);
+  }
 }
 
 async function listPlans(req, res, next) {
@@ -490,6 +512,7 @@ async function renamePlan(req, res, next) {
 }
 
 module.exports = {
+  generatePlanPreview,
   listPlans,
   getPlan,
   createPlan,

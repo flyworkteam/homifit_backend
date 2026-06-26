@@ -36,6 +36,23 @@ function deriveMuscle(path) {
   return MUSCLE_BY_FOLDER[folder] || null;
 }
 
+// Some exercise rows (notably the duplicated "<slug>-720" variants imported
+// from raw video files) have a NULL thumbnail_path even though a poster exists
+// on the CDN under the clean slug. Derive `exercise-thumbs/<clean>.jpg` from the
+// video filename, stripping the trailing video-resolution suffix, so the API
+// always returns a working thumbnail URL.
+const RESOLUTION_SUFFIX = /-(?:144|240|360|480|540|720|1080|1440|2160)$/;
+
+function deriveThumbnailPath(videoCdnPath) {
+  if (!videoCdnPath || typeof videoCdnPath !== 'string') return null;
+  const file = videoCdnPath.split('/').filter(Boolean).pop();
+  if (!file) return null;
+  let base = file.replace(/\.[^.]+$/, ''); // drop extension
+  base = base.replace(RESOLUTION_SUFFIX, ''); // drop -720 etc.
+  if (!base) return null;
+  return `exercise-thumbs/${base}.jpg`;
+}
+
 function rowToExercise(r, locale) {
   if (!r) return null;
   const isTr = String(locale || '').toLowerCase().startsWith('tr');
@@ -56,7 +73,9 @@ function rowToExercise(r, locale) {
     difficulty: r.difficulty,
     needsEquipment: Boolean(r.needs_equipment),
     videoUrl: r.video_url || buildVideoUrl(r.video_cdn_path),
-    thumbnailUrl: buildVideoUrl(r.thumbnail_path),
+    thumbnailUrl:
+      buildVideoUrl(r.thumbnail_path) ||
+      buildVideoUrl(deriveThumbnailPath(r.video_cdn_path)),
     description: r.description,
     tip: r.tip,
   };

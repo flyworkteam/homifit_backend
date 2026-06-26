@@ -1,6 +1,12 @@
 const { pool } = require('../config/db');
 const catalog = require('./videoCatalog');
 
+// Duplicate exercise rows with a resolution suffix in their slug (e.g.
+// "bodyweight-squat-720") are junk — they have null thumbnails and ugly names.
+// Always prefer the canonical clean-slug row when resolving for plan saves.
+const RESOLUTION_SUFFIX = /-(?:144|240|360|480|540|720|1080|1440|2160)$/;
+function cleanSlug(s) { return String(s || '').replace(RESOLUTION_SUFFIX, ''); }
+
 /**
  * Resolve a (slug, name) pair to an exercise row id, auto-inserting a
  * minimal row if it doesn't exist yet. Looks up the BunnyCDN video URL
@@ -20,12 +26,26 @@ async function resolveOrCreate({ slug, name, unit = 'reps', primaryMuscle = null
   if (!slug) throw new Error('exercise slug is required');
   const db = conn || pool;
 
+  // Strip resolution suffix so junk "-720" slugs resolve to the canonical row.
+  const resolvedSlug = cleanSlug(slug);
+
   const [existing] = await db.execute(
     'SELECT id FROM exercises WHERE slug = ? LIMIT 1',
-    [slug],
+    [resolvedSlug],
   );
   if (existing.length > 0) {
     return existing[0].id;
+  }
+
+  // Also check original slug in case only it exists (no clean counterpart yet).
+  if (resolvedSlug !== slug) {
+    const [origExisting] = await db.execute(
+      'SELECT id FROM exercises WHERE slug = ? LIMIT 1',
+      [slug],
+    );
+    if (origExisting.length > 0) {
+      return origExisting[0].id;
+    }
   }
 
   // Look up video URL from the manifest if available.
@@ -52,7 +72,7 @@ async function resolveOrCreate({ slug, name, unit = 'reps', primaryMuscle = null
   const [insert] = await db.execute(
     `INSERT INTO exercises (slug, name_en, primary_muscle, unit, video_cdn_path, video_url, active)
      VALUES (?, ?, ?, ?, ?, ?, 1)`,
-    [slug, name || slug, primaryMuscle, unit === 'seconds' ? 'seconds' : 'reps', videoCdnPath, videoUrl],
+    [resolvedSlug, name || resolvedSlug, primaryMuscle, unit === 'seconds' ? 'seconds' : 'reps', videoCdnPath, videoUrl],
   );
   return insert.insertId;
 }

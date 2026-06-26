@@ -11,6 +11,43 @@ function thumbUrl(path) {
   }
 }
 
+// Mirror of workoutController.deriveThumbnailPath: when an exercise has no
+// thumbnail_path, derive `exercise-thumbs/<clean>.jpg` from its video filename
+// (stripping the trailing resolution suffix) so history rows still get a real
+// per-exercise poster instead of falling back to the neutral muscle icon.
+const RESOLUTION_SUFFIX = /-(?:144|240|360|480|540|720|1080|1440|2160)$/;
+
+function deriveThumbnailPath(videoCdnPath) {
+  if (!videoCdnPath || typeof videoCdnPath !== 'string') return null;
+  const file = videoCdnPath.split('/').filter(Boolean).pop();
+  if (!file) return null;
+  let base = file.replace(/\.[^.]+$/, '');
+  base = base.replace(RESOLUTION_SUFFIX, '');
+  if (!base) return null;
+  return `exercise-thumbs/${base}.jpg`;
+}
+
+// Collapse a raw muscle name (primary or secondary) into one of the canonical
+// focus categories the client localises in `_muscleLabel`. Keeps the Training
+// Insights muscle chart clean and translated instead of leaking raw DB strings.
+function muscleToFocus(muscle) {
+  const m = String(muscle || '').toLowerCase();
+  if (!m) return null;
+  if (m.includes('chest') || m.includes('pec')) return 'chest';
+  if (m.includes('lat') || m.includes('back') || m.includes('trap') || m.includes('rhom')) return 'back';
+  if (m.includes('shoulder') || m.includes('delt')) return 'shoulders';
+  if (m.includes('bicep') || m.includes('tricep') || m.includes('forearm') || m.includes('arm')) return 'arms';
+  if (m.includes('glute')) return 'glutes';
+  if (
+    m.includes('quad') || m.includes('hamstring') || m.includes('calf')
+    || m.includes('calves') || m.includes('adductor') || m.includes('abductor')
+    || m.includes('leg')
+  ) return 'legs';
+  if (m.includes('core') || m.includes('abdom') || m.includes('oblique') || m === 'abs') return 'core';
+  if (m.includes('cardio') || m.includes('full')) return 'cardio';
+  return 'full_body';
+}
+
 /**
  * Batch-load the first exercise (lowest position) for a set of join-table
  * groups, so each history row can show a real per-exercise image — the same
@@ -26,7 +63,7 @@ async function loadFirstExercise(joinTable, groupCol, ids) {
   const ph = ids.map(() => '?').join(',');
   const [rows] = await pool.execute(
     `SELECT j.${groupCol} AS gid, e.slug, e.video_url, e.video_cdn_path,
-            e.primary_muscle
+            e.thumbnail_path, e.primary_muscle
        FROM ${joinTable} j
        JOIN exercises e ON e.id = j.exercise_id
       WHERE j.${groupCol} IN (${ph})
@@ -39,6 +76,12 @@ async function loadFirstExercise(joinTable, groupCol, ids) {
     map.set(r.gid, {
       slug: r.slug,
       videoUrl: r.video_url || thumbUrl(r.video_cdn_path),
+      // Real per-exercise poster (same source the plan/home cards use), so the
+      // history row shows the workout's photo even when there's no gendered
+      // demo photo and the template thumbnail is NULL.
+      thumbnailUrl:
+        thumbUrl(r.thumbnail_path) ||
+        thumbUrl(deriveThumbnailPath(r.video_cdn_path)),
       primaryMuscle: r.primary_muscle || null,
     });
   }
@@ -242,6 +285,17 @@ async function upsertDay(req, res, next) {
         ],
       );
 
+      // 4. Clear any saved in-progress resume state for this workout — the
+      //    session is now complete, so re-entering should start fresh.
+      const scopeKey = scopeKeyFor(planDayId, templateId);
+      if (scopeKey) {
+        await conn.execute(
+          `DELETE FROM workout_session_progress
+            WHERE user_id = ? AND scope_key = ?`,
+          [req.userId, scopeKey],
+        );
+      }
+
       await conn.commit();
     } catch (err) {
       await conn.rollback();
@@ -256,6 +310,112 @@ async function upsertDay(req, res, next) {
       data: { date: dayStr, counters },
       error: null,
     });
+  } catch (error) {
+    next(error);
+  }
+}
+
+// ── In-progress workout resume state ───────────────────────────────────────
+// Saves / loads the last exercise+set index the user reached inside a workout
+// that was started but not completed, so re-entering resumes from where they
+// left off. Scope is the plan day (or quick-workout template); cleared on the
+// matching completion in upsertDay.
+
+function scopeKeyFor(planDayId, templateId) {
+  if (planDayId) return `day:${planDayId}`;
+  if (templateId) return `tpl:${templateId}`;
+  return null;
+}
+
+async function getActiveSession(req, res, next) {
+  try {
+    const planDayId = req.query.planDayId
+      ? Number.parseInt(req.query.planDayId, 10)
+      : null;
+    const templateId = req.query.templateId
+      ? Number.parseInt(req.query.templateId, 10)
+      : null;
+    const scopeKey = scopeKeyFor(planDayId, templateId);
+    if (!scopeKey) {
+      res.json({ success: true, data: { progress: null }, error: null });
+      return;
+    }
+    const [rows] = await pool.execute(
+      `SELECT exercise_index, set_index
+         FROM workout_session_progress
+        WHERE user_id = ? AND scope_key = ?
+        LIMIT 1`,
+      [req.userId, scopeKey],
+    );
+    const row = rows[0];
+    res.json({
+      success: true,
+      data: {
+        progress: row
+          ? {
+              exerciseIndex: Number(row.exercise_index) || 0,
+              setIndex: Number(row.set_index) || 0,
+            }
+          : null,
+      },
+      error: null,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function saveActiveSession(req, res, next) {
+  try {
+    const body = req.body || {};
+    const planDayId = body.planDayId
+      ? Number.parseInt(body.planDayId, 10)
+      : null;
+    const templateId = body.templateId
+      ? Number.parseInt(body.templateId, 10)
+      : null;
+    const scopeKey = scopeKeyFor(planDayId, templateId);
+    if (!scopeKey) {
+      throw new AppError('planDayId or templateId is required', 400);
+    }
+    const exerciseIndex = Math.max(0, Number.parseInt(body.exerciseIndex, 10) || 0);
+    const setIndex = Math.max(0, Number.parseInt(body.setIndex, 10) || 0);
+
+    await pool.execute(
+      `INSERT INTO workout_session_progress
+         (user_id, scope_key, plan_day_id, template_id, exercise_index, set_index)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         plan_day_id    = VALUES(plan_day_id),
+         template_id    = VALUES(template_id),
+         exercise_index = VALUES(exercise_index),
+         set_index      = VALUES(set_index)`,
+      [req.userId, scopeKey, planDayId, templateId, exerciseIndex, setIndex],
+    );
+
+    res.json({ success: true, data: { ok: true }, error: null });
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function clearActiveSession(req, res, next) {
+  try {
+    const planDayId = req.query.planDayId
+      ? Number.parseInt(req.query.planDayId, 10)
+      : null;
+    const templateId = req.query.templateId
+      ? Number.parseInt(req.query.templateId, 10)
+      : null;
+    const scopeKey = scopeKeyFor(planDayId, templateId);
+    if (scopeKey) {
+      await pool.execute(
+        `DELETE FROM workout_session_progress
+          WHERE user_id = ? AND scope_key = ?`,
+        [req.userId, scopeKey],
+      );
+    }
+    res.json({ success: true, data: { ok: true }, error: null });
   } catch (error) {
     next(error);
   }
@@ -618,6 +778,14 @@ async function getHistory(req, res, next) {
   try {
     const userId = req.userId;
 
+    // Skip content-less junk logs: a session with no duration AND no link to a
+    // template / plan day is an aborted or accidental completion (it shows up as
+    // "Antrenman · 0 egzersiz · 0:00 dk · 0 kcal"). Keep anything with real
+    // duration or that points at actual workout content. Reused by totals + list
+    // so the stat tiles and the rows stay consistent.
+    const MEANINGFUL =
+      '(ws.duration_sec > 0 OR ws.template_id IS NOT NULL OR ws.plan_day_id IS NOT NULL)';
+
     const [totRows] = await pool.execute(
       `SELECT COUNT(*) AS workouts,
               COALESCE(SUM(duration_sec),0) AS total_sec,
@@ -626,8 +794,8 @@ async function getHistory(req, res, next) {
          FROM (
            SELECT duration_sec, calories_kcal,
                   ROUND(COALESCE(duration_sec,0)/60) AS minutes_from_dur
-             FROM workout_sessions
-            WHERE user_id=? AND completed_at IS NOT NULL
+             FROM workout_sessions ws
+            WHERE user_id=? AND completed_at IS NOT NULL AND ${MEANINGFUL}
          ) s`,
       [userId],
     );
@@ -648,7 +816,7 @@ async function getHistory(req, res, next) {
          LEFT JOIN workout_templates t ON t.id = ws.template_id
          LEFT JOIN user_plan_days pd ON pd.id = ws.plan_day_id
          LEFT JOIN user_plans p ON p.id = ws.plan_id
-        WHERE ws.user_id=? AND ws.completed_at IS NOT NULL
+        WHERE ws.user_id=? AND ws.completed_at IS NOT NULL AND ${MEANINGFUL}
         ORDER BY ws.completed_at DESC
         LIMIT 50`,
       [userId],
@@ -680,7 +848,10 @@ async function getHistory(req, res, next) {
         exerciseCount: Number(r.exercise_count) || 0,
         durationSec: durSec,
         calories: kcal,
-        thumbnailUrl: thumbUrl(r.t_thumb),
+        // Prefer the template thumbnail; for plan sessions (and templates with
+        // no thumbnail) fall back to the first exercise's real poster.
+        thumbnailUrl:
+            thumbUrl(r.t_thumb) || (firstEx ? firstEx.thumbnailUrl : null),
         // First exercise → lets the client render the user's gendered demo
         // photo (or the video poster frame) when the template thumb is NULL.
         exerciseSlug: firstEx ? firstEx.slug : null,
@@ -741,7 +912,8 @@ async function getSessionDetail(req, res, next) {
     if (s.template_id) {
       const [r] = await pool.execute(
         `SELECT e.slug, e.name_en, e.name_tr, e.primary_muscle, e.secondary_muscles,
-                e.unit, wte.sets, wte.reps, wte.hold_seconds, wte.position
+                e.unit, e.thumbnail_path, e.video_cdn_path,
+                wte.sets, wte.reps, wte.hold_seconds, wte.position
            FROM workout_template_exercises wte
            JOIN exercises e ON e.id = wte.exercise_id
           WHERE wte.template_id=? ORDER BY wte.position`,
@@ -751,7 +923,8 @@ async function getSessionDetail(req, res, next) {
     } else if (s.plan_day_id) {
       const [r] = await pool.execute(
         `SELECT e.slug, e.name_en, e.name_tr, e.primary_muscle, e.secondary_muscles,
-                e.unit, pde.sets, pde.reps, pde.hold_seconds, pde.position
+                e.unit, e.thumbnail_path, e.video_cdn_path,
+                pde.sets, pde.reps, pde.hold_seconds, pde.position
            FROM user_plan_day_exercises pde
            JOIN exercises e ON e.id = pde.exercise_id
           WHERE pde.day_id=? ORDER BY pde.position`,
@@ -780,20 +953,40 @@ async function getSessionDetail(req, res, next) {
         sets: Number(m.sets) || 0,
         reps: m.reps != null ? Number(m.reps) : null,
         holdSeconds: m.hold_seconds != null ? Number(m.hold_seconds) : null,
+        // Real per-exercise poster so the summary's move rows render the
+        // workout's photo (gendered demo → this thumbnail → neutral icon).
+        thumbnailUrl:
+            thumbUrl(m.thumbnail_path) ||
+            thumbUrl(deriveThumbnailPath(m.video_cdn_path)),
         done: true,
       };
     });
 
-    // Muscle focus + volume (per session).
-    const muscleMap = new Map();
+    // Muscle focus + volume — derived entirely from the session's exercises.
+    // Every set directly trains its exercise's primary muscle (direct volume) and
+    // also indirectly stimulates each listed secondary muscle (indirect volume),
+    // so both the focus chart and the volume split reflect what was actually done.
+    const muscleMap = new Map(); // focus slug -> weighted set count
     let totalSets = 0;
+    let directSets = 0; // sets attributed to a primary muscle
+    let indirectSets = 0; // set-instances attributed to secondary muscles
     let kgMoved = 0;
     const userWeight = 70; // default estimate for the "shareable win"
+    const addFocus = (muscle, sets) => {
+      const focus = muscleToFocus(muscle);
+      if (!focus) return;
+      muscleMap.set(focus, (muscleMap.get(focus) || 0) + sets);
+    };
     for (const m of moves) {
       totalSets += m.sets;
       if (m.primaryMuscle) {
-        muscleMap.set(m.primaryMuscle,
-          (muscleMap.get(m.primaryMuscle) || 0) + m.sets);
+        addFocus(m.primaryMuscle, m.sets);
+        directSets += m.sets;
+      }
+      for (const sec of m.secondaryMuscles) {
+        if (!sec) continue;
+        addFocus(sec, m.sets * 0.5); // secondary muscles get half-credit
+        indirectSets += m.sets;
       }
       // reps-equivalent for kg-moved estimate (a hold ≈ ~one rep per 3s).
       const repsEquiv = m.unit === 'seconds'
@@ -804,10 +997,9 @@ async function getSessionDetail(req, res, next) {
       kgMoved += m.sets * repsEquiv * userWeight * 0.08;
     }
     const muscleFocus = [...muscleMap.entries()]
-      .map(([muscle, sets]) => ({ muscle, sets }))
+      .map(([muscle, sets]) => ({ muscle, sets: Math.round(sets) }))
+      .filter((f) => f.sets > 0)
       .sort((a, b) => b.sets - a.sets);
-    const directSets = muscleFocus.length ? muscleFocus[0].sets : 0;
-    const indirectSets = Math.max(0, totalSets - directSets);
 
     const durSec = Number(s.duration_sec) || 0;
     let kcal = s.calories_kcal != null ? Number(s.calories_kcal) : 0;
@@ -818,6 +1010,11 @@ async function getSessionDetail(req, res, next) {
       data: {
         id: s.id,
         completedAt: s.completed_at,
+        // Identity of the workout that was performed, so the client can
+        // re-launch the exact same session ("Do again") and label it correctly.
+        templateId: s.template_id || null,
+        planDayId: s.plan_day_id || null,
+        planId: s.plan_id || null,
         titleEn: s.t_en || s.day_title || s.plan_title || null,
         titleTr: s.t_tr || s.day_title || s.plan_title || null,
         templateSlug: s.t_slug || null,
@@ -847,4 +1044,7 @@ module.exports = {
   getStats,
   getHistory,
   getSessionDetail,
+  getActiveSession,
+  saveActiveSession,
+  clearActiveSession,
 };

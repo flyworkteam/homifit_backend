@@ -5,6 +5,7 @@ const controller = require('../controllers/planController');
 const router = express.Router();
 
 router.get('/', requireAuth, controller.listPlans);
+router.post('/generate', requireAuth, controller.generatePlanPreview);
 // `loadPremium` populates req.premium so createPlan can enforce the
 // free-tier caps (no `advanced` level, max 5 active plans). It's a single
 // indexed SELECT and runs only on plan creation, so the perf cost is nil.
