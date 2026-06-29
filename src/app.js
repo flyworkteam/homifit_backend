@@ -12,6 +12,28 @@ const app = express();
 
 app.disable('x-powered-by');
 
+// In production the API runs behind a reverse proxy (nginx / Docker), so the
+// real client IP arrives via the `X-Forwarded-For` header. Express must be told
+// to trust that proxy hop, otherwise `req.ip` is wrong AND express-rate-limit
+// throws `ERR_ERL_UNEXPECTED_X_FORWARDED_FOR` on every request, which surfaces
+// to clients as a generic 500 "Internal server error".
+//
+// Default: trust the first proxy hop (the standard, safe choice for a single
+// reverse proxy). Override via TRUST_PROXY env when needed:
+//   TRUST_PROXY=2      -> trust 2 hops
+//   TRUST_PROXY=true   -> trust all proxies (only behind a trusted network)
+//   TRUST_PROXY=false  -> disable (direct, no proxy)
+//   TRUST_PROXY=10.0.0.0/8 -> trust a specific subnet
+function resolveTrustProxy() {
+  const raw = process.env.TRUST_PROXY;
+  if (raw == null || raw === '') return 1;
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  const n = Number.parseInt(raw, 10);
+  return Number.isInteger(n) && String(n) === raw ? n : raw;
+}
+app.set('trust proxy', resolveTrustProxy());
+
 app.use(helmet());
 
 const allowedOrigins = process.env.ALLOWED_ORIGINS
