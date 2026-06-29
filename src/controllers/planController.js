@@ -224,66 +224,69 @@ async function listPlans(req, res, next) {
   }
 }
 
+// Loads the full canonical shape of a plan (days + exercises) for a user.
+// Returns `null` when the plan doesn't exist / isn't owned by the user.
+async function loadPlanShape(planId, userId, locale) {
+  const [plans] = await pool.execute(
+    'SELECT * FROM user_plans WHERE id = ? AND user_id = ? LIMIT 1',
+    [planId, userId],
+  );
+  if (plans.length === 0) return null;
+  const plan = plans[0];
+
+  const [days] = await pool.execute(
+    'SELECT * FROM user_plan_days WHERE plan_id = ? ORDER BY weekday',
+    [plan.id],
+  );
+
+  const dayIds = days.map((d) => d.id);
+  const exercisesByDay = {};
+  if (dayIds.length > 0) {
+    const placeholders = dayIds.map(() => '?').join(',');
+    const [exRows] = await pool.execute(
+      `SELECT pde.day_id, pde.position, pde.sets, pde.reps,
+              pde.hold_seconds, pde.rest_seconds, e.*
+         FROM user_plan_day_exercises pde
+         JOIN exercises e ON e.id = pde.exercise_id
+        WHERE pde.day_id IN (${placeholders})
+        ORDER BY pde.day_id, pde.position`,
+      dayIds,
+    );
+    for (const row of exRows) {
+      const k = row.day_id;
+      if (!exercisesByDay[k]) exercisesByDay[k] = [];
+      exercisesByDay[k].push({
+        ...rowToExercise(row, locale),
+        position: row.position,
+        sets: row.sets,
+        reps: row.reps,
+        holdSeconds: row.hold_seconds,
+        restSeconds: row.rest_seconds,
+      });
+    }
+  }
+
+  return {
+    ...rowToPlan(plan),
+    days: days.map((d) => ({
+      id: d.id,
+      weekday: d.weekday,
+      title: d.title,
+      exercises: exercisesByDay[d.id] || [],
+    })),
+  };
+}
+
 async function getPlan(req, res, next) {
   try {
     const id = Number.parseInt(req.params.id, 10);
     if (!Number.isInteger(id)) throw new AppError('id must be integer', 400);
     const locale = String(req.query.locale || req.locale || 'en');
 
-    const [plans] = await pool.execute(
-      'SELECT * FROM user_plans WHERE id = ? AND user_id = ? LIMIT 1',
-      [id, req.userId],
-    );
-    if (plans.length === 0) throw new AppError('Plan not found', 404);
-    const plan = plans[0];
+    const plan = await loadPlanShape(id, req.userId, locale);
+    if (!plan) throw new AppError('Plan not found', 404);
 
-    const [days] = await pool.execute(
-      'SELECT * FROM user_plan_days WHERE plan_id = ? ORDER BY weekday',
-      [plan.id],
-    );
-
-    const dayIds = days.map((d) => d.id);
-    let exercisesByDay = {};
-    if (dayIds.length > 0) {
-      const placeholders = dayIds.map(() => '?').join(',');
-      const [exRows] = await pool.execute(
-        `SELECT pde.day_id, pde.position, pde.sets, pde.reps,
-                pde.hold_seconds, pde.rest_seconds, e.*
-           FROM user_plan_day_exercises pde
-           JOIN exercises e ON e.id = pde.exercise_id
-          WHERE pde.day_id IN (${placeholders})
-          ORDER BY pde.day_id, pde.position`,
-        dayIds,
-      );
-      for (const row of exRows) {
-        const k = row.day_id;
-        if (!exercisesByDay[k]) exercisesByDay[k] = [];
-        exercisesByDay[k].push({
-          ...rowToExercise(row, locale),
-          position: row.position,
-          sets: row.sets,
-          reps: row.reps,
-          holdSeconds: row.hold_seconds,
-          restSeconds: row.rest_seconds,
-        });
-      }
-    }
-
-    res.json({
-      success: true,
-      data: {
-        plan: {
-          ...rowToPlan(plan),
-          days: days.map((d) => ({
-            id: d.id,
-            weekday: d.weekday,
-            title: d.title,
-            exercises: exercisesByDay[d.id] || [],
-          })),
-        },
-      },
-      error: null,
-    });
+    res.json({ success: true, data: { plan }, error: null });
   } catch (error) {
     next(error);
   }
@@ -411,9 +414,43 @@ async function createPlan(req, res, next) {
 
       await conn.commit();
 
-      // Re-fetch the canonical shape for the response.
-      req.params = { id: planId };
-      return getPlan(req, res, next);
+      // The plan is now COMMITTED. Re-reading it for a richer response must
+      // never turn a successful save into a 500 — otherwise the user sees
+      // "Plan kaydedilemedi" for a plan that's actually in their account.
+      const locale = String(req.body.locale || req.locale || 'en');
+      try {
+        const plan = await loadPlanShape(planId, req.userId, locale);
+        if (plan) {
+          return res.json({ success: true, data: { plan }, error: null });
+        }
+        // Fall through to the minimal shape below if the read-back came up empty
+        // (e.g. replica lag).
+        throw new Error('read-back returned empty plan');
+      } catch (readErr) {
+        // eslint-disable-next-line no-console
+        console.error('[createPlan] post-commit read-back failed:', readErr);
+        // Minimal but valid success payload. The client only needs the id to
+        // continue, so a read-back failure is non-fatal here.
+        return res.json({
+          success: true,
+          data: {
+            plan: {
+              id: planId,
+              source: input.source,
+              title: input.title,
+              goal: input.goal,
+              level: input.level,
+              durationMin: input.durationMin,
+              daysPerWeek: input.daysPerWeek,
+              focusAreas: input.focusAreas,
+              isActive: input.isActive,
+              isArchived: false,
+              days: [],
+            },
+          },
+          error: null,
+        });
+      }
     } catch (err) {
       await conn.rollback();
       throw err;
